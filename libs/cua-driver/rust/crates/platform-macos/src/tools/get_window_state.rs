@@ -23,6 +23,94 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 /// Slack past `timeout_ms` before the walk task is abandoned: one in-flight AX
 /// call may still be waiting on its messaging timeout.
 const AX_WALK_BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+const AX_READ_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+// Bulk AX walks share the process's native accessibility transport. Keep
+// that expensive work bounded; screenshot-only previews do not enter here.
+fn ax_read_gate() -> Arc<tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
+
+#[derive(Debug)]
+enum AxReadError {
+    QueueBusy,
+    Worker(tokio::task::JoinError),
+    Backstop,
+}
+
+async fn acquire_ax_read(
+    gate: Arc<tokio::sync::Semaphore>,
+    queue_wait: std::time::Duration,
+) -> Result<Arc<tokio::sync::OwnedSemaphorePermit>, AxReadError> {
+    let permit = tokio::time::timeout(queue_wait, gate.acquire_owned())
+        .await
+        .map_err(|_| AxReadError::QueueBusy)?
+        .map_err(|_| AxReadError::QueueBusy)?;
+    Ok(Arc::new(permit))
+}
+
+async fn run_ax_read<T, F>(
+    gate: Arc<tokio::sync::Semaphore>,
+    queue_wait: std::time::Duration,
+    backstop: std::time::Duration,
+    work: F,
+) -> Result<(T, Arc<tokio::sync::OwnedSemaphorePermit>), AxReadError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let lease = acquire_ax_read(gate, queue_wait).await?;
+    let worker_lease = lease.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        // A timeout drops the JoinHandle, not this native worker. Its permit
+        // must live until the real walk exits, so retries cannot pile up walks.
+        let _permit = worker_lease;
+        work()
+    });
+    let value = tokio::time::timeout(backstop, worker)
+        .await
+        .map_err(|_| AxReadError::Backstop)?
+        .map_err(AxReadError::Worker)?;
+    Ok((value, lease))
+}
+
+fn collapse_closed_menus(
+    include_menu_items: Option<bool>,
+    query: Option<&str>,
+    full_output: bool,
+    observation_only: bool,
+) -> bool {
+    include_menu_items.map_or_else(
+        || query.is_none_or(|q| q.trim().is_empty()) && !full_output && !observation_only,
+        |include| !include,
+    )
+}
+
+/// AX exposes the application's logical window while WindowServer may expose
+/// a transformed presentation frame. A capture matching that smaller frame
+/// alone does not prove a transform for the AX rows returned beside it.
+fn validate_ax_capture_geometry(
+    window_id: u32,
+    bounds: &crate::windows::WindowBounds,
+    ax_frame: Option<[f64; 4]>,
+) -> Result<(), super::px_frame::PxFrameError> {
+    if let Some(ax) = ax_frame {
+        let live = [bounds.x, bounds.y, bounds.width, bounds.height];
+        if !ax
+            .iter()
+            .zip(live)
+            .all(|(a, b)| a.is_finite() && b.is_finite() && (*a - b).abs() <= 1.0)
+        {
+            return Err(super::px_frame::PxFrameError::CaptureUnavailable {
+                window_id,
+                reason: format!("AX window frame {ax:?} disagrees with live WindowServer frame {live:?}; wait for the window geometry to settle before using pixels"),
+            });
+        }
+    }
+    Ok(())
+}
 
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
@@ -45,6 +133,10 @@ fn def() -> &'static ToolDef {
                 "window_id": { "type": "integer", "description": "Target window ID from list_windows." },
                 "query": { "type": "string", "description": "Case-insensitive substring filter: returns matching rows plus ancestors; element_index values are not renumbered. Try this before a full read." },
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
+                "include_menu_items": {
+                    "type": "boolean",
+                    "description": "Expand closed menu-bar menus. By default full_output/query expands them. False keeps titles and any open menu, avoiding unrelated closed-menu walks while preserving the window controls."
+                },
                 "include_accessibility_tree": {
                     "type": "boolean",
                     "description": "Default true. False skips the AX walk and returns the screenshot plus window metadata. Both this and include_screenshot false is an error."
@@ -271,36 +363,44 @@ impl Tool for GetWindowStateTool {
 
         // A model-facing read lists the menu bar's top-level titles only; a
         // query or full_output walks every menu as before.
-        let collapse_menus = query.as_deref().is_none_or(|q| q.trim().is_empty())
-            && !view.full_output
-            && !observation_only;
-        let (tree_result, prepared_snapshot) = if want_tree {
+        let collapse_menus = collapse_closed_menus(
+            args.get("include_menu_items").and_then(Value::as_bool),
+            query.as_deref(),
+            view.full_output,
+            observation_only,
+        );
+        let (tree_result, prepared_snapshot, _ax_read_lease) = if want_tree {
             let q = query.clone();
             // `timeout_ms` bounds the walk itself: it returns the partial tree
             // when the budget runs out. The outer deadline is only a backstop
             // for an AX call that ignores the per-element messaging timeout
             // (dropping a spawn_blocking JoinHandle cannot cancel it).
-            let walk_future = tokio::task::spawn_blocking(move || {
-                let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
-                    crate::ax::tree::walk_tree_budgeted(
-                        pid,
-                        Some(window_id),
-                        q.as_deref(),
-                        max_depth,
-                        cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements),
-                    )
-                });
-                let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
-                (tree, payload)
-            });
-            // A launching app is waited on for up to `timeout_ms` before the
-            // walk's own `timeout_ms` starts (see `ax::launch`).
+            // Queueing is bounded separately from the walk's existing budget.
             let backstop =
                 std::time::Duration::from_millis(timeout_ms) * 2 + AX_WALK_BACKSTOP_GRACE;
-            match tokio::time::timeout(backstop, walk_future).await {
-                Ok(Ok((tree, payload))) => (Some(tree), Some(payload)),
-                Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
-                Err(_elapsed) => {
+            let walk_future =
+                run_ax_read(ax_read_gate(), AX_READ_QUEUE_WAIT, backstop, move || {
+                    let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
+                        crate::ax::tree::walk_tree_budgeted(
+                            pid,
+                            Some(window_id),
+                            q.as_deref(),
+                            max_depth,
+                            cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements),
+                        )
+                    });
+                    let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
+                    (tree, payload)
+                });
+            // A launching app is waited on for up to `timeout_ms` before the
+            // walk's own `timeout_ms` starts (see `ax::launch`).
+            match walk_future.await {
+                Ok(((tree, payload), lease)) => (Some(tree), Some(payload), Some(lease)),
+                Err(AxReadError::QueueBusy) => return ToolResult::error(format!(
+                    "AX tree reader for pid={pid} stayed busy for 5 s; this walk was not started. Read screenshot-only, or try a fresh tree later."
+                )),
+                Err(AxReadError::Worker(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
+                Err(AxReadError::Backstop) => {
                     return ToolResult::error(format!(
                         "AX tree walk for pid={pid} did not return within {} s: an \
                          accessibility call stopped answering past the {timeout_ms} ms \
@@ -311,7 +411,17 @@ impl Tool for GetWindowStateTool {
                 }
             }
         } else {
-            (None, None)
+            // A normal screenshot-only read still probes AX capabilities below;
+            // pure display-only previews perform no AX and bypass this lane.
+            let lease = if display_only {
+                None
+            } else {
+                match acquire_ax_read(ax_read_gate(), AX_READ_QUEUE_WAIT).await {
+                    Ok(lease) => Some(lease),
+                    Err(_) => return ToolResult::error("AX capability reader stayed busy for 5 s; no AX probe was started. Use display_only:true for a preview."),
+                }
+            };
+            (None, None, lease)
         };
 
         // The window can close, or its CGWindow can be re-parented onto another
@@ -350,6 +460,12 @@ impl Tool for GetWindowStateTool {
         // against, and the raw capture's backing scale.
         let mut screenshot_frame_error = None;
         let mut screenshot_resize_scale = None;
+        let ax_window_frame = tree_result.as_ref().and_then(|tree| {
+            tree.nodes
+                .iter()
+                .find(|node| node.depth == 0 && node.role == "AXWindow")
+                .and_then(|node| node.frame)
+        });
         let screenshot = if should_capture {
             let out_file = screenshot_out_file.clone();
             let res = tokio::task::spawn_blocking(move || -> Result<
@@ -368,6 +484,7 @@ impl Tool for GetWindowStateTool {
                 let bounds = crate::windows::window_bounds_by_id(window_id)
                     .filter(|b| b.width > 0.0 && b.height > 0.0)
                     .ok_or(super::px_frame::PxFrameError::WindowNotFound { window_id })?;
+                validate_ax_capture_geometry(window_id, &bounds, ax_window_frame)?;
                 let raw = crate::capture::screenshot_window_bytes(window_id).map_err(|e| {
                     super::px_frame::PxFrameError::CaptureUnavailable {
                         window_id,
@@ -735,7 +852,11 @@ impl Tool for GetWindowStateTool {
         // previews poll several times a second.
         if !display_only {
             let capture_available = screenshot_dims.is_some();
+            // AX post-processing belongs to the same read. Keep the lease in
+            // both the caller and its native worker if either outlives the other.
+            let probe_lease = _ax_read_lease.clone();
             let report = tokio::task::spawn_blocking(move || {
+                let _lease = probe_lease;
                 let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
                 cua_driver_core::background_input::background_input_capability_report(
                     cua_driver_core::background_input::ExactWindowTarget { pid, window_id },
@@ -1759,5 +1880,170 @@ mod tests {
             "observation-only entries must not emit unregistered element_token: {}",
             entries[0]
         );
+    }
+}
+
+#[cfg(test)]
+mod ax_read_gate_tests {
+    use super::{collapse_closed_menus, run_ax_read, validate_ax_capture_geometry, AxReadError};
+
+    #[test]
+    fn ax_capture_geometry_refuses_transformed_or_moved_frames_but_keeps_pixel_only_reads() {
+        let bounds = crate::windows::WindowBounds {
+            x: 320.0,
+            y: 120.0,
+            width: 230.0,
+            height: 408.0,
+        };
+        assert!(
+            validate_ax_capture_geometry(2, &bounds, Some([320.0, 120.0, 230.0, 408.0])).is_ok()
+        );
+        assert!(
+            validate_ax_capture_geometry(2, &bounds, Some([320.5, 120.0, 230.0, 407.5])).is_ok()
+        );
+        assert!(validate_ax_capture_geometry(2, &bounds, None).is_ok());
+        for frame in [
+            [143.0, 115.0, 87.0, 154.0],
+            [400.0, 120.0, 230.0, 408.0],
+            [f64::NAN, 120.0, 230.0, 408.0],
+        ] {
+            let error = validate_ax_capture_geometry(2, &bounds, Some(frame)).unwrap_err();
+            let state = super::super::px_frame::error_structured(&error);
+            assert_eq!(state["code"], "px_capture_unavailable");
+            assert!(state["reason"].as_str().unwrap().contains("disagrees"));
+        }
+    }
+
+    #[test]
+    fn explicit_closed_menu_scope_preserves_default_and_full_output_contracts() {
+        assert!(collapse_closed_menus(None, None, false, false));
+        assert!(!collapse_closed_menus(None, None, true, false));
+        assert!(!collapse_closed_menus(None, Some("Save"), false, false));
+        assert!(!collapse_closed_menus(None, None, false, true));
+        assert!(collapse_closed_menus(Some(false), None, true, false));
+        assert!(!collapse_closed_menus(Some(true), None, false, false));
+    }
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn concurrent_bulk_reads_never_enter_native_work_together() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let call = || {
+            let (gate, active, peak) = (gate.clone(), active.clone(), peak.clone());
+            run_ax_read(
+                gate,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                move || {
+                    let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(n, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(10));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    42
+                },
+            )
+        };
+        let collect = || async {
+            let (value, _lease) = call().await.unwrap();
+            value
+        };
+        let (a, b, c) = tokio::join!(collect(), collect(), collect());
+        assert_eq!((a, b, c), (42, 42, 42));
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_backstop_does_not_release_the_native_worker_permit() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let first = run_ax_read(
+            gate.clone(),
+            Duration::from_secs(5),
+            Duration::ZERO,
+            move || {
+                let _ = started.send(());
+                let _ = blocked.recv();
+            },
+        )
+        .await;
+        assert!(matches!(first, Err(AxReadError::Backstop)));
+        entered.await.expect("native worker starts");
+        let next = run_ax_read(gate.clone(), Duration::ZERO, Duration::from_secs(5), || {
+            panic!("busy native worker was duplicated")
+        })
+        .await;
+        assert!(matches!(next, Err(AxReadError::QueueBusy)));
+        release.send(()).unwrap();
+        assert_eq!(
+            run_ax_read(gate, Duration::from_secs(5), Duration::from_secs(5), || 7)
+                .await
+                .unwrap()
+                .0,
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn postprocessing_keeps_the_read_slot_after_the_walk_finishes() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let (value, lease) = run_ax_read(
+            gate.clone(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            || 1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, 1);
+        let blocked = run_ax_read(gate.clone(), Duration::ZERO, Duration::from_secs(5), || {
+            panic!("post-processing overlapped the next AX read")
+        })
+        .await;
+        assert!(matches!(blocked, Err(AxReadError::QueueBusy)));
+        drop(lease);
+        let (next, _lease) =
+            run_ax_read(gate, Duration::from_secs(5), Duration::from_secs(5), || 2)
+                .await
+                .unwrap();
+        assert_eq!(next, 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_queued_never_starts_a_late_native_walk() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = gate.clone().acquire_owned().await.unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let work_hits = hits.clone();
+        let queued_gate = gate.clone();
+        let queued = tokio::spawn(async move {
+            run_ax_read(
+                queued_gate,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                move || {
+                    work_hits.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+        drop(held);
+        assert_eq!(
+            run_ax_read(gate, Duration::from_secs(5), Duration::from_secs(5), || 9)
+                .await
+                .unwrap()
+                .0,
+            9
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 }

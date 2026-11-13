@@ -10,38 +10,12 @@ pub struct ElectronJs;
 impl ElectronJs {
     /// Returns true if the process at `pid` is an Electron app.
     pub fn is_electron(pid: i32) -> bool {
-        // Look up the bundle path from list_running_apps.
-        let apps = crate::apps::list_running_apps();
-        let app = apps.iter().find(|a| a.pid == pid);
-
-        if let Some(app) = app {
-            // Try to infer bundle path from app name.
-            let bundle_path = find_bundle_path_for_app(&app.name);
-            if let Some(bp) = bundle_path {
-                let electron_fw = format!("{bp}/Contents/Frameworks/Electron Framework.framework");
-                if std::path::Path::new(&electron_fw).exists() {
-                    return true;
-                }
-            }
-        }
-
-        // Fallback: check executable via lsof or ps.
-        // Check if the executable itself links Electron.
-        if let Ok(exe) = get_exe_path(pid) {
-            // Check parent dir for Electron Framework.
-            let exe_path = std::path::Path::new(&exe);
-            if let Some(parent) = exe_path.parent() {
-                // e.g. /Applications/Slack.app/Contents/MacOS/Slack → look for Frameworks sibling
-                if let Some(macos_dir) = parent.parent() {
-                    let electron_fw = macos_dir.join("Frameworks/Electron Framework.framework");
-                    if electron_fw.exists() {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
+        // This runs before native AX presses. Enumerating every running app
+        // here used to fork plist readers for every bundle on every click,
+        // holding the global input coordinator for seconds under load.
+        // The kernel's executable for this exact pid is sufficient.
+        crate::apps::path_of_pid(pid)
+            .is_some_and(|path| executable_is_electron(std::path::Path::new(&path)))
     }
 
     /// Evaluate JavaScript in the Electron app's main (Node.js) process at
@@ -113,37 +87,51 @@ impl ElectronJs {
     }
 }
 
-/// Get the executable path of a process using `ps`.
-fn get_exe_path(pid: i32) -> anyhow::Result<String> {
-    let out = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if s.is_empty() {
-        anyhow::bail!("No exe for pid {pid}");
-    }
-    Ok(s)
+/// Detect the framework beside this executable, including nonstandard install
+/// locations. Never infer another process's bundle from a display name.
+fn executable_is_electron(executable: &std::path::Path) -> bool {
+    let Some(macos) = executable
+        .parent()
+        .filter(|p| p.ends_with("Contents/MacOS"))
+    else {
+        return false;
+    };
+    macos.parent().is_some_and(|contents| {
+        contents
+            .join("Frameworks/Electron Framework.framework")
+            .is_dir()
+    })
 }
 
-/// Find the .app bundle path for an app by name (searches common locations).
-fn find_bundle_path_for_app(name: &str) -> Option<String> {
-    let dirs = [
-        "/Applications",
-        "/Applications/Utilities",
-        "/System/Applications",
-    ];
-    let home = std::env::var("HOME").unwrap_or_default();
-    let user_apps = format!("{home}/Applications");
+#[cfg(test)]
+mod tests {
+    use super::executable_is_electron;
 
-    let mut all_dirs: Vec<&str> = dirs.to_vec();
-    let user_str: &str = &user_apps;
-    all_dirs.push(user_str);
-
-    for dir in all_dirs {
-        let candidate = format!("{dir}/{name}.app");
-        if std::path::Path::new(&candidate).exists() {
-            return Some(candidate);
-        }
+    #[test]
+    fn identifies_the_exact_bundle_in_a_nonstandard_install_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let contents = dir.path().join("Trial Apps/聊天客户端.app/Contents");
+        std::fs::create_dir_all(contents.join("Frameworks/Electron Framework.framework")).unwrap();
+        assert!(executable_is_electron(&contents.join("MacOS/Chat")));
     }
-    None
+
+    #[test]
+    fn another_bundle_with_the_same_name_cannot_classify_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let electron = dir.path().join("Electron/Calculator.app/Contents");
+        let native = dir.path().join("Native/Calculator.app/Contents");
+        std::fs::create_dir_all(electron.join("Frameworks/Electron Framework.framework")).unwrap();
+        std::fs::create_dir_all(native.join("MacOS")).unwrap();
+        assert!(executable_is_electron(&electron.join("MacOS/Calculator")));
+        assert!(!executable_is_electron(&native.join("MacOS/Calculator")));
+    }
+
+    #[test]
+    fn unrelated_framework_and_missing_executable_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Frameworks/Electron Framework.framework"))
+            .unwrap();
+        assert!(!executable_is_electron(&dir.path().join("bin/tool")));
+        assert!(!executable_is_electron(std::path::Path::new("")));
+    }
 }

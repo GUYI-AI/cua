@@ -95,7 +95,7 @@ fn all_pids() -> Vec<i32> {
 
 /// The executable path of one live pid, via `proc_pidpath`. `None` when the
 /// process has already exited or its path is not readable.
-fn path_of_pid(pid: i32) -> Option<String> {
+pub(crate) fn path_of_pid(pid: i32) -> Option<String> {
     extern "C" {
         fn proc_pidpath(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
     }
@@ -1002,26 +1002,14 @@ pub fn bundle_id_for_pid(pid: i32) -> Option<String> {
     }
 }
 
-/// Return the localized application name for a running process by PID.
-/// Uses `ps -p {pid} -o comm=` which gives the command name without path.
-/// Returns `None` if the PID is unknown or the command fails.
+/// Return the running executable's basename by PID. Kernel proc_pidpath
+/// avoids forking `ps` for every AX read and live-preview frame.
 pub fn get_app_name_for_pid(pid: i32) -> Option<String> {
-    let out = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .ok()?;
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        return None;
-    }
-    // Strip path prefix: "/Applications/Safari.app/Contents/MacOS/Safari" → "Safari"
-    Some(
-        std::path::Path::new(&raw)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&raw)
-            .to_string(),
-    )
+    let path = path_of_pid(pid)?;
+    std::path::Path::new(&path)
+        .file_name()?
+        .to_str()
+        .map(str::to_owned)
 }
 
 /// Format the app list in the same text style as libs/cua-driver.
@@ -1049,8 +1037,8 @@ pub fn format_app_list(apps: &[AppInfo]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_pids, bundle_root_of_executable, finder_folder_handoff, merge_app_lists, path_of_pid,
-        running_apps_from_processes, AppInfo,
+        all_pids, bundle_root_of_executable, finder_folder_handoff, get_app_name_for_pid,
+        merge_app_lists, path_of_pid, running_apps_from_processes, AppInfo,
     };
     use std::collections::HashSet;
 
@@ -1345,6 +1333,11 @@ mod tests {
         let expected = std::fs::canonicalize(std::env::current_exe().expect("current exe"))
             .expect("canonical exe");
         assert_eq!(std::path::Path::new(&path), expected);
+        assert_eq!(
+            get_app_name_for_pid(own).as_deref(),
+            expected.file_name().and_then(|n| n.to_str())
+        );
+        assert_eq!(get_app_name_for_pid(i32::MAX), None);
     }
 
     #[test]

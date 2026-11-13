@@ -683,6 +683,9 @@ impl Tool for ClickTool {
                     target_rect,
                 )
                 .await;
+                if let Some(refusal) = cua_driver_core::tool::refuse_ending_input(&args) {
+                    return refusal;
+                }
                 self.state
                     .cursor_registry
                     .update_position(&cursor_key, cx, cy);
@@ -731,6 +734,9 @@ impl Tool for ClickTool {
                     target_rect,
                 )
                 .await;
+                if let Some(refusal) = cua_driver_core::tool::refuse_ending_input(&args) {
+                    return refusal;
+                }
                 // Keep the registry in sync with the overlay so
                 // get_agent_cursor_state reports a truthful position even when
                 // the click was dispatched via the AX path (no pixel coords).
@@ -738,6 +744,10 @@ impl Tool for ClickTool {
                     .cursor_registry
                     .update_position(&cursor_key, cx, cy);
                 self.state.cursor_registry.note_press(&cursor_key, cx, cy);
+            }
+
+            if let Some(refusal) = cua_driver_core::tool::refuse_ending_input(&args) {
+                return refusal;
             }
 
             // Finder icon/list items can expose a readable AXSelected state
@@ -795,13 +805,19 @@ impl Tool for ClickTool {
             // itself via FocusGuard. After the action returns, detect any
             // new-window / foreground side-effects and append a one-liner
             // suffix matching Swift's wording.
+            if let Some(refusal) = cua_driver_core::tool::refuse_ending_input(&args) {
+                return refusal;
+            }
             let prior_front = apps::frontmost_pid();
             let foreground = delivery_mode.is_foreground();
+            let snapshot_started = std::time::Instant::now();
             let snapshot = if foreground {
                 WindowChangeDetector::snapshot_without_suppression(prior_front)
             } else {
                 WindowChangeDetector::snapshot(prior_front)
             };
+            tracing::info!(target: "cua_driver_core::tool", tool = "click", phase = "ax_snapshot",
+                elapsed_ms = snapshot_started.elapsed().as_millis() as u64, "cua input timing");
 
             // Run AX work on a blocking thread (can't block async executor).
             // Use `effective_action` so button=right rewrites press → show_menu.
@@ -812,6 +828,7 @@ impl Tool for ClickTool {
             // and stomp default for a non-default session).
             let ck = cursor_key.clone();
             let selection_modifiers = modifiers.clone();
+            let ax_started = std::time::Instant::now();
             let result = focus_guard::with_focus_suppressed(
                 if foreground { None } else { Some(pid) },
                 prior_front,
@@ -870,10 +887,14 @@ impl Tool for ClickTool {
                 },
             )
             .await;
+            tracing::info!(target: "cua_driver_core::tool", tool = "click", phase = "ax_dispatch_guard",
+                elapsed_ms = ax_started.elapsed().as_millis() as u64, "cua input timing");
 
             // Drop the wildcard lease + detect window/foreground side-effects.
             let acted_at = std::time::Instant::now();
             let changes = super::finish_window_observation(snapshot).await;
+            tracing::info!(target: "cua_driver_core::tool", tool = "click", phase = "ax_observation",
+                elapsed_ms = acted_at.elapsed().as_millis() as u64, "cua input timing");
 
             match result {
                 Ok(Ok((
@@ -1119,6 +1140,9 @@ impl Tool for ClickTool {
             // Animate the visual cursor to the click point and wait for it to
             // arrive — mirrors Swift's `AgentCursor.shared.animateAndWait(to:)`.
             crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
+            if let Some(refusal) = cua_driver_core::tool::refuse_ending_input(&args) {
+                return refusal;
+            }
             // Keep the registry in sync with the overlay (see AX path above).
             self.state
                 .cursor_registry
@@ -1484,8 +1508,11 @@ fn press_needs_key_window(action: &str, front_pid: Option<i32>, pid: i32, native
 /// or taking key status from the user's window (the focus record only, as the
 /// background pixel click does), then let AppKit settle.
 fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str) {
+    let started = std::time::Instant::now();
     let native = !super::type_text::is_browser_pid(pid)
         && !crate::browser::electron_js::ElectronJs::is_electron(pid);
+    tracing::info!(target: "cua_driver_core::tool", tool = "click", phase = "ax_target_classification",
+        elapsed_ms = started.elapsed().as_millis() as u64, "cua input timing");
     if press_needs_key_window(action, apps::frontmost_pid(), pid, native)
         && crate::input::skylight::activate_without_raise_with(pid, window_id, false)
     {

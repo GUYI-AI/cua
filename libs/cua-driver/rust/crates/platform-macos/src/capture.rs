@@ -41,11 +41,10 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use objc2::rc::autoreleasepool;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Bounded TTL map keyed by insertion time. Std-only; used for the warm SCK
@@ -365,36 +364,126 @@ const WINDOW_PLAN_CACHE_CAPACITY: usize = 32;
 /// walk's own 20-second bound. The shell fallback retains its prior behavior.
 const WINDOW_CAPTURE_NATIVE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Permit at most one ScreenCaptureKit worker. If an Apple completion callback
-/// never fires, the timed-out worker keeps this permit, and every later request
-/// goes straight to the compatibility fallback instead of leaking more
-/// blocked threads.
+/// One native worker, with a bounded FIFO for healthy overlapping captures.
+/// A timed-out Apple callback keeps its permit; later calls then fall back
+/// immediately instead of spawning replacement workers or filling the queue.
 struct NativeCaptureGate {
-    active: AtomicBool,
+    state: Mutex<NativeCaptureState>,
+    ready: Condvar,
+}
+
+struct NativeCaptureState {
+    next: u64,
+    active: Option<u64>,
+    stalled: bool,
+    waiting: VecDeque<u64>,
 }
 
 impl NativeCaptureGate {
     const fn new() -> Self {
         Self {
-            active: AtomicBool::new(false),
+            state: Mutex::new(NativeCaptureState {
+                next: 0,
+                active: None,
+                stalled: false,
+                waiting: VecDeque::new(),
+            }),
+            ready: Condvar::new(),
         }
     }
 
     fn try_acquire(&'static self) -> Option<NativeCapturePermit> {
-        self.active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| NativeCapturePermit { gate: self })
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active.is_some() || !state.waiting.is_empty() {
+            return None;
+        }
+        state.next += 1;
+        let generation = state.next;
+        state.active = Some(generation);
+        state.stalled = false;
+        Some(NativeCapturePermit {
+            gate: self,
+            generation,
+        })
+    }
+
+    fn acquire(&'static self, timeout: Duration) -> anyhow::Result<NativeCapturePermit> {
+        let started = Instant::now();
+        if let Some(permit) = self.try_acquire() {
+            return Ok(permit);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stalled || state.waiting.len() >= 32 {
+            anyhow::bail!("ScreenCaptureKit capture already in flight");
+        }
+        state.next += 1;
+        let generation = state.next;
+        state.waiting.push_back(generation);
+        loop {
+            if state.stalled {
+                state.waiting.retain(|id| *id != generation);
+                self.ready.notify_all();
+                anyhow::bail!("ScreenCaptureKit capture already in flight");
+            }
+            let Some(left) = timeout
+                .checked_sub(started.elapsed())
+                .filter(|left| !left.is_zero())
+            else {
+                state.waiting.retain(|id| *id != generation);
+                self.ready.notify_all();
+                anyhow::bail!("ScreenCaptureKit capture wait timed out");
+            };
+            if state.active.is_none() && state.waiting.front() == Some(&generation) {
+                state.waiting.pop_front();
+                state.active = Some(generation);
+                state.stalled = false;
+                return Ok(NativeCapturePermit {
+                    gate: self,
+                    generation,
+                });
+            }
+            (state, _) = self
+                .ready
+                .wait_timeout(state, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn mark_stalled(&self, generation: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active == Some(generation) {
+            state.stalled = true;
+            self.ready.notify_all();
+        }
     }
 }
 
 struct NativeCapturePermit {
     gate: &'static NativeCaptureGate,
+    generation: u64,
 }
 
 impl Drop for NativeCapturePermit {
     fn drop(&mut self) {
-        self.gate.active.store(false, Ordering::Release);
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active == Some(self.generation) {
+            state.active = None;
+            state.stalled = false;
+            self.gate.ready.notify_all();
+        }
     }
 }
 
@@ -412,9 +501,9 @@ where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    let permit = gate
-        .try_acquire()
-        .ok_or_else(|| anyhow::anyhow!("ScreenCaptureKit capture already in flight"))?;
+    let started = Instant::now();
+    let permit = gate.acquire(timeout)?;
+    let generation = permit.generation;
     let (sender, receiver) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("cua-sck-window-capture".into())
@@ -425,9 +514,10 @@ where
         })
         .map_err(|error| anyhow::anyhow!("failed to start ScreenCaptureKit worker: {error}"))?;
 
-    match receiver.recv_timeout(timeout) {
+    match receiver.recv_timeout(timeout.saturating_sub(started.elapsed())) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
+            gate.mark_stalled(generation);
             anyhow::bail!(
                 "ScreenCaptureKit capture timed out after {} ms",
                 timeout.as_millis()
@@ -463,7 +553,7 @@ fn build_window_capture_plan(
     window_id: u32,
     expected_identity: WindowCaptureIdentity,
 ) -> anyhow::Result<std::sync::Arc<WindowCapturePlan>> {
-    use screencapturekit::prelude::{SCContentFilter, SCShareableContent, SCStreamConfiguration};
+    use screencapturekit::prelude::{SCContentFilter, SCShareableContent};
 
     let content = SCShareableContent::get()
         .map_err(|e| anyhow::anyhow!("SCShareableContent::get failed: {e}"))?;
@@ -519,15 +609,33 @@ fn build_window_capture_plan(
     let out_w = rounded_pixel_dim(width_pts * scale, "width")?;
     let out_h = rounded_pixel_dim(height_pts * scale, "height")?;
 
-    let config = SCStreamConfiguration::new()
-        .with_width(out_w)
-        .with_height(out_h);
+    let config = window_capture_config(out_w, out_h);
 
     Ok(std::sync::Arc::new(WindowCapturePlan {
         filter,
         config,
         identity: expected_identity,
     }))
+}
+
+/// Output configuration for a single-window capture.
+///
+/// The hardware pointer stays out. ScreenCaptureKit draws it by default, and
+/// with a desktop-independent window filter it grows the captured area to
+/// take in a pointer that sits outside the window, then shrinks that larger
+/// area into the configured `width`x`height`. The window then shows up scaled
+/// (for example to 96.5%) and offset inside an image whose size still matches
+/// its bounds, so the frame check passes with scale 1 and every pixel
+/// coordinate read off it lands off target. `screencapture -l` and the
+/// SkyLight path never include the pointer either.
+fn window_capture_config(
+    out_w: u32,
+    out_h: u32,
+) -> screencapturekit::prelude::SCStreamConfiguration {
+    screencapturekit::prelude::SCStreamConfiguration::new()
+        .with_width(out_w)
+        .with_height(out_h)
+        .with_shows_cursor(false)
 }
 
 /// Single-frame capture + RGBA/PNG encode from an existing plan.
@@ -1104,6 +1212,16 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
+    /// Regression for trycua/cua#5476: with the pointer outside the window,
+    /// a pointer-showing window capture came back scaled and offset while
+    /// still sized like the window, so clicks aimed from it missed by ~37 px.
+    #[test]
+    fn window_capture_config_leaves_the_pointer_out_at_the_planned_size() {
+        let config = window_capture_config(1240, 900);
+        assert!(!config.shows_cursor());
+        assert_eq!((config.width(), config.height()), (1240, 900));
+    }
+
     #[test]
     fn off_space_window_uses_skylight_before_public_backends() {
         let public_calls = Cell::new(0u32);
@@ -1472,6 +1590,74 @@ mod tests {
     }
 
     #[test]
+    fn healthy_overlapping_reads_wait_instead_of_falling_back() {
+        static GATE: NativeCaptureGate = NativeCaptureGate::new();
+        let (started, observed) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            run_native_capture_worker(&GATE, Duration::from_secs(5), move || {
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(1u8)
+            })
+        });
+        observed.recv().unwrap();
+        let second = std::thread::spawn(move || {
+            run_native_capture_worker(&GATE, Duration::from_secs(5), || Ok(2u8))
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while GATE.state.lock().unwrap().waiting.is_empty() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let queued = !GATE.state.lock().unwrap().waiting.is_empty();
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap(), 1);
+        let second = second.join().unwrap();
+        assert!(
+            queued,
+            "second capture must queue while a healthy worker runs"
+        );
+        assert_eq!(
+            second.unwrap(),
+            2,
+            "ordinary overlap must not take the shell fallback"
+        );
+    }
+
+    #[test]
+    fn expired_capture_waiter_never_starts_work_or_blocks_the_next_read() {
+        static GATE: NativeCaptureGate = NativeCaptureGate::new();
+        let held = GATE.try_acquire().unwrap();
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits = called.clone();
+        let result = run_native_capture_worker(&GATE, Duration::from_millis(10), move || {
+            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(1u8)
+        });
+        assert!(result.unwrap_err().to_string().contains("wait timed out"));
+        assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(GATE.state.lock().unwrap().waiting.is_empty());
+        drop(held);
+        assert_eq!(
+            run_native_capture_worker(&GATE, Duration::from_secs(1), || Ok(3u8)).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn old_capture_timeout_cannot_poison_a_new_worker() {
+        static GATE: NativeCaptureGate = NativeCaptureGate::new();
+        let old = GATE.try_acquire().unwrap();
+        let old_generation = old.generation;
+        drop(old);
+        let current = GATE.try_acquire().unwrap();
+        GATE.mark_stalled(old_generation);
+        assert!(!GATE.state.lock().unwrap().stalled);
+        assert_eq!(GATE.state.lock().unwrap().active, Some(current.generation));
+        drop(current);
+    }
+
+    #[test]
     fn pooled_native_worker_returns_work_result_and_error() {
         static GATE: NativeCaptureGate = NativeCaptureGate::new();
 
@@ -1532,10 +1718,10 @@ mod tests {
 
         release_sender.send(()).expect("release original worker");
         let deadline = Instant::now() + Duration::from_secs(1);
-        while GATE.active.load(AtomicOrdering::Acquire) && Instant::now() < deadline {
+        while GATE.state.lock().unwrap().active.is_some() && Instant::now() < deadline {
             std::thread::yield_now();
         }
-        assert!(!GATE.active.load(AtomicOrdering::Acquire));
+        assert!(!GATE.state.lock().unwrap().active.is_some());
 
         assert_eq!(
             run_native_capture_worker(&GATE, Duration::from_secs(1), || {

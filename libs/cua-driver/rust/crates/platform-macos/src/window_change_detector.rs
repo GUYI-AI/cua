@@ -590,7 +590,10 @@ impl Snapshot {
 
 /// The host's visible layer-0 windows.
 fn host_windows() -> Vec<WindowInfo> {
-    windows::visible_windows()
+    // This observer compares on-screen window ids, not Space membership.
+    // Rebuilding every window's Space metadata on every 25ms poll holds up
+    // the action coordinator even though none of that data enters the diff.
+    windows::on_screen_windows_any_layer()
         .into_iter()
         .filter(|w| w.layer == 0)
         .collect()

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -2220,6 +2220,7 @@ impl ToolRegistry {
                     | "end_session"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
+        let lock_started = Instant::now();
         let _desktop_action = if requires_desktop_coordination(
             resolved_name,
             &args,
@@ -2238,6 +2239,24 @@ impl ToolRegistry {
         } else {
             None
         };
+        let lock_wait_ms = lock_started.elapsed().as_millis() as u64;
+        if is_physical_desktop_action(resolved_name) {
+            tracing::info!(
+                tool = resolved_name,
+                phase = "admitted",
+                lock_wait_ms,
+                session = runtime_session.as_deref().unwrap_or(""),
+                pid = args.get("pid").and_then(|value| value.as_i64()),
+                window_id = args.get("window_id").and_then(|value| value.as_u64()),
+                "cua input timing"
+            );
+            // A call can be admitted before its owner disconnects, then sit
+            // behind another agent's input. Ending must be rechecked at the
+            // actual dispatch boundary, after that wait.
+            if let Some(refusal) = refuse_ending_input(&args) {
+                return refusal;
+            }
+        }
         let pending_turn = should_record
             .then(|| {
                 // Use the same trusted identities the recording owner was minted from.
@@ -2275,11 +2294,22 @@ impl ToolRegistry {
         // Desktop pixels read off a capped get_desktop_state image are mapped
         // back to the uncapped capture before any platform interprets them.
         crate::desktop_capture_scale::map_desktop_args(&mut args);
+        let dispatch_started = Instant::now();
         let mut result = crate::recording::scope_dispatch_click_capture(
             pending_turn.as_ref(),
             tool.invoke(args.clone()),
         )
         .await;
+        if is_physical_desktop_action(resolved_name) {
+            tracing::info!(
+                tool = resolved_name,
+                phase = "completed",
+                lock_wait_ms,
+                elapsed_ms = dispatch_started.elapsed().as_millis() as u64,
+                session = runtime_session.as_deref().unwrap_or(""),
+                "cua input timing"
+            );
+        }
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
                 crate::desktop_capture_scale::record_desktop_state(
@@ -5863,6 +5893,52 @@ resources:
         ));
     }
 
+    #[tokio::test]
+    async fn ending_session_cannot_dispatch_an_input_already_waiting_for_the_desktop_lock() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = input_registry(None, hits.clone());
+        let context = standard_context();
+        let runtime_session = context.runtime_session_key("queued-cancel");
+        registry
+            .protected_resource_ownership()
+            .mark_driver_owned_pid(&runtime_session, 42);
+        let lock = desktop_action_coordinator().lock().await;
+        let mut call = Box::pin(registry.invoke_with_context(
+            "click",
+            serde_json::json!({"pid":42,"window_id":7,"session":"queued-cancel","x":10,"y":20}),
+            context,
+        ));
+        // Poll the real registry up to its lock wait; the synthetic adapter
+        // below is never invoked while this test holds the physical lane.
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        crate::session::end_session(&runtime_session);
+        assert!(crate::session::is_session_ending(&runtime_session));
+        assert!(
+            !crate::session::is_session_ended(&runtime_session),
+            "the dispatch guard must already be in flight"
+        );
+        drop(lock);
+        let result = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|v| v.pointer("/refusal/code"))
+                .and_then(serde_json::Value::as_str),
+            Some("session_ended")
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn physical_desktop_actions_are_admitted_one_at_a_time() {
         let active = Arc::new(AtomicUsize::new(0));
@@ -6097,6 +6173,21 @@ fn protected_refusal(code: &str, message: &str) -> ToolResult {
             "message": message,
         }
     }))
+}
+
+/// Adapters must recheck this after an asynchronous preparation such as a
+/// cursor glide, immediately before dispatching native input. Only the private
+/// lifecycle id minted by the registry is used; public labels grant nothing.
+pub fn refuse_ending_input(args: &Value) -> Option<ToolResult> {
+    args.get("_session_id")
+        .and_then(Value::as_str)
+        .filter(|session| crate::session::is_session_ending(session))
+        .map(|_| {
+            protected_refusal(
+                "session_ended",
+                "session is ending; this input was not dispatched",
+            )
+        })
 }
 
 fn is_existing_profile_prepare(tool_name: &str, args: &Value) -> bool {

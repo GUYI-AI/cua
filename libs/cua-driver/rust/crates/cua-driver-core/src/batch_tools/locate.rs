@@ -51,6 +51,11 @@ pub(crate) const DEFAULT_EXPECT_TIMEOUT_MS: u64 = 2_000;
 /// Longest wait any single check may ask for.
 pub(crate) const MAX_CHECK_TIMEOUT_MS: u64 = 10_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// timeout_ms:0 means one current probe, not no I/O and not an unbounded wait.
+/// Use the existing native default walk budget as the whole probe's cap,
+/// including window discovery, baseline, admission and post-processing.
+const ZERO_WAIT_PROBE_BUDGET: Duration =
+    Duration::from_millis(crate::tool_schema::TIMEOUT_MS_DEFAULT);
 const CANDIDATES_SHOWN: usize = 5;
 /// Most windows of one app a lookup reads per poll.
 const MAX_WINDOWS_SEARCHED: usize = 4;
@@ -376,6 +381,8 @@ pub(crate) struct Read {
     pub window: Window,
     pub elements: Vec<Value>,
     pub markdown: String,
+    /// A budget/element-limit truncation cannot establish absence or uniqueness.
+    pub incomplete: bool,
 }
 
 /// An element found by description.
@@ -424,6 +431,7 @@ impl Miss {
                 | "window_not_found"
                 | "still_present"
                 | "unexpected_state"
+                | "incomplete_read"
         )
     }
 
@@ -479,12 +487,101 @@ impl<'a> Locator<'a> {
         args
     }
 
-    async fn call(&self, tool: &str, args: Value) -> Result<Value, String> {
-        let result = self.registry.invoke(tool, self.with_session(args)).await;
-        if result.is_error == Some(true) {
-            return Err(format!("{tool}: {}", first_text(&result)));
+    /// Derive the private lifecycle key from the trusted dispatch context,
+    /// never from a caller-supplied private id or a process-global public label.
+    fn ensure_active(&self) -> Result<(), Miss> {
+        if let Some(context) = crate::tool::current_dispatch_authorization_context() {
+            let label = self.session.as_deref().or_else(|| context.public_session());
+            if context.is_revoked()
+                || label.is_some_and(|label| {
+                    crate::session::is_session_ending(&context.runtime_session_key(label))
+                })
+            {
+                return Err(Miss::new(
+                    "cancelled",
+                    "lookup cancelled because its owning session is ending or revoked; no new read or input was dispatched",
+                ));
+            }
         }
-        Ok(result.structured_content.unwrap_or(Value::Null))
+        Ok(())
+    }
+
+    fn remaining_ms(&self, deadline: Instant) -> Result<u64, Miss> {
+        self.ensure_active()?;
+        let remaining = deadline
+            .min(self.deadline)
+            .saturating_duration_since(Instant::now());
+        let ms = remaining.as_millis().min(u64::MAX as u128) as u64;
+        if ms == 0 {
+            return Err(lookup_timeout());
+        }
+        Ok(ms)
+    }
+
+    /// Include registry admission, native queueing and post-processing in the
+    /// same deadline. Dropping a timed-out read does not imply that its native
+    /// worker stopped; do not start another read or return a token afterward.
+    async fn within<T>(
+        &self,
+        deadline: Instant,
+        future: impl std::future::Future<Output = Result<T, Miss>>,
+    ) -> Result<T, Miss> {
+        let deadline = deadline.min(self.deadline);
+        self.remaining_ms(deadline)?;
+        tokio::pin!(future);
+        let expires = tokio::time::sleep_until(deadline.into());
+        tokio::pin!(expires);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut expires => return Err(lookup_timeout()),
+                result = &mut future => {
+                    self.remaining_ms(deadline)?;
+                    return result;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => self.ensure_active()?,
+            }
+        }
+    }
+
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, Miss> {
+        let started = Instant::now();
+        let result = self
+            .within(self.deadline, async {
+                let result = self.registry.invoke(tool, self.with_session(args)).await;
+                if result.is_error == Some(true) {
+                    let code = if tool == "get_window_state" {
+                        // Only an authoritative closed-window refusal proves the
+                        // list/read race. Permission, busy and timeout errors do not.
+                        if result
+                            .structured_content
+                            .as_ref()
+                            .and_then(|state| {
+                                state.pointer("/refusal/code").or_else(|| state.get("code"))
+                            })
+                            .and_then(Value::as_str)
+                            == Some("window_id_not_found")
+                        {
+                            "window_not_found"
+                        } else {
+                            "read_failed"
+                        }
+                    } else {
+                        "lookup_failed"
+                    };
+                    return Err(Miss::new(code, format!("{tool}: {}", first_text(&result))));
+                }
+                Ok(result.structured_content.unwrap_or(Value::Null))
+            })
+            .await;
+        tracing::info!(
+            tool,
+            phase = "locate_read",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            session = self.session.as_deref().unwrap_or(""),
+            "cua input timing"
+        );
+        result
     }
 
     /// Resolve a spec to one window. With only `app` or `pid`, the app's
@@ -522,10 +619,7 @@ impl<'a> Locator<'a> {
         if let Some(pid) = spec.pid {
             list_args["pid"] = json!(pid);
         }
-        let listed = self
-            .call("list_windows", list_args)
-            .await
-            .map_err(|error| Miss::new("lookup_failed", error))?;
+        let listed = self.call("list_windows", list_args).await?;
         let windows: Vec<Value> = listed
             .get("windows")
             .and_then(Value::as_array)
@@ -688,6 +782,25 @@ impl<'a> Locator<'a> {
     /// One fresh accessibility read. It refreshes the window's element
     /// tokens, so the tokens it returns are the ones to act with.
     pub async fn read(&self, window: &Window) -> Result<Read, Miss> {
+        // ScriptAPI also uses Locator reads without a find/check selector.
+        // Preserve its full-output scope and the Locator's batch deadline.
+        let selector = ElementSpec::default();
+        self.read_scoped(window, &selector, None).await
+    }
+
+    async fn read_scoped(
+        &self,
+        window: &Window,
+        element: &ElementSpec,
+        native_budget: Option<Instant>,
+    ) -> Result<Read, Miss> {
+        // Only named find/check reads override the native AX budget. Legacy
+        // ScriptAPI reads keep its default, while still obeying the batch cap.
+        let deadline = native_budget.unwrap_or(self.deadline).min(self.deadline);
+        let scoped_non_menu = element
+            .role
+            .as_deref()
+            .is_some_and(|role| !role_family(role).starts_with("menu"));
         if let Some(max_elements) = self.baseline_max_elements {
             let first = self
                 .baselined
@@ -696,31 +809,68 @@ impl<'a> Locator<'a> {
                 .insert((window.pid, window.window_id));
             if first {
                 // Best effort: a failed baseline only means a full end read.
-                let _ = self
-                    .call(
-                        "get_window_state",
-                        json!({
-                            "pid": window.pid,
-                            "window_id": window.window_id,
-                            "max_elements": max_elements,
-                            "include_screenshot": false,
-                        }),
-                    )
-                    .await;
-            }
-        }
-        let state = self
-            .call(
-                "get_window_state",
-                json!({
+                let mut args = json!({
                     "pid": window.pid,
                     "window_id": window.window_id,
-                    "full_output": true,
+                    "max_elements": max_elements,
                     "include_screenshot": false,
-                }),
-            )
+                });
+                if scoped_non_menu {
+                    args["tree_format"] = json!("both");
+                    args["include_menu_items"] = json!(false);
+                }
+                if native_budget.is_some() {
+                    args["timeout_ms"] = json!(self.remaining_ms(deadline)?);
+                }
+                let baseline = self
+                    .within(deadline, self.call("get_window_state", args))
+                    .await;
+                // Best effort must not swallow cancellation or budget exhaustion.
+                self.remaining_ms(deadline)?;
+                // A complete current baseline already contains the whole
+                // same non-menu search domain. Use its fresh tokens directly;
+                // a second walk only adds queueing to the same find deadline.
+                // An incomplete/unproven or menu-scoped read is never reused.
+                if scoped_non_menu {
+                    if let Ok(state) = baseline {
+                        if state.get("truncated").and_then(Value::as_bool) == Some(false)
+                            && state.get("elements").is_some_and(Value::is_array)
+                        {
+                            return Ok(Read {
+                                window: window.clone(),
+                                elements: state["elements"].as_array().unwrap().clone(),
+                                markdown: state
+                                    .get("tree_markdown")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                incomplete: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        self.remaining_ms(deadline)?;
+        let mut args = json!({
+            "pid": window.pid,
+            "window_id": window.window_id,
+            "full_output": true,
+            "include_screenshot": false,
+        });
+        if native_budget.is_some() {
+            args["timeout_ms"] = json!(self.remaining_ms(deadline)?);
+        }
+        // Keep full_output for fresh tokens without replacing since:latest's
+        // baseline. Only an explicit non-menu role narrows the traversal;
+        // name-only selectors retain the full menu/ambiguity semantics.
+        if scoped_non_menu {
+            args["include_menu_items"] = json!(false);
+        }
+        let state = self
+            .within(deadline, self.call("get_window_state", args))
             .await
-            .map_err(|error| Miss::new("read_failed", error).in_window(window))?;
+            .map_err(|miss| miss.in_window(window))?;
         let elements = state
             .get("elements")
             .and_then(Value::as_array)
@@ -735,6 +885,7 @@ impl<'a> Locator<'a> {
             window: window.clone(),
             elements,
             markdown,
+            incomplete: state.get("truncated").and_then(Value::as_bool) == Some(true),
         })
     }
 
@@ -746,14 +897,21 @@ impl<'a> Locator<'a> {
         timeout: Duration,
     ) -> Result<Found, Miss> {
         let started = Instant::now();
-        let deadline = (started + timeout).min(self.deadline);
+        let budget = if timeout.is_zero() {
+            ZERO_WAIT_PROBE_BUDGET
+        } else {
+            timeout
+        };
+        let deadline = (started + budget).min(self.deadline);
         loop {
-            let attempt = self.find_once(window, element).await;
+            let attempt = self
+                .within(deadline, self.find_once(window, element, deadline))
+                .await;
             match attempt {
                 Ok(found) => return Ok(found),
                 Err(miss) if !miss.worth_waiting() => return Err(miss),
                 Err(miss) => {
-                    if Instant::now() + POLL_INTERVAL > deadline {
+                    if timeout.is_zero() || Instant::now() + POLL_INTERVAL > deadline {
                         let waited = started.elapsed().as_millis();
                         let mut miss = miss;
                         if waited > 0 {
@@ -770,14 +928,24 @@ impl<'a> Locator<'a> {
     /// One pass over the windows `spec` names: the first window holding a
     /// unique match wins. When none does, the miss comes from the window
     /// with the most elements, whose nearest matches are the useful ones.
-    async fn find_once(&self, spec: &WindowSpec, element: &ElementSpec) -> Result<Found, Miss> {
+    async fn find_once(
+        &self,
+        spec: &WindowSpec,
+        element: &ElementSpec,
+        deadline: Instant,
+    ) -> Result<Found, Miss> {
         let windows = self.search_windows(spec).await?;
         let mut best_miss: Option<(usize, Miss)> = None;
         for window in &windows {
-            let read = self.read(window).await?;
+            let read = self.read_scoped(window, element, Some(deadline)).await?;
             match pick(&read, element) {
                 Ok(found) => return Ok(found),
-                Err(miss) if miss.code == "ambiguous" || miss.code == "not_addressable" => {
+                Err(miss)
+                    if matches!(
+                        miss.code,
+                        "ambiguous" | "not_addressable" | "incomplete_read"
+                    ) =>
+                {
                     return Err(miss.in_window(window))
                 }
                 Err(miss) => {
@@ -806,6 +974,7 @@ impl<'a> Locator<'a> {
         check: &Check,
         spec: &WindowSpec,
         started: Instant,
+        deadline: Instant,
     ) -> Result<Checked, Miss> {
         let windows = match self.search_windows(spec).await {
             Ok(windows) => windows,
@@ -822,11 +991,14 @@ impl<'a> Locator<'a> {
         };
         let mut best_miss: Option<(usize, Miss)> = None;
         for window in &windows {
-            let read = match self.read(window).await {
+            let read = match self
+                .read_scoped(window, &check.element, Some(deadline))
+                .await
+            {
                 Ok(read) => read,
-                // A window that closed between the lookup and the read has
-                // no elements left.
-                Err(_) if check.gone => continue,
+                // A structured native missing-window refusal is the only read
+                // failure that proves this window closed after list_windows.
+                Err(miss) if check.gone && miss.code == "window_not_found" => continue,
                 Err(miss) => return Err(miss),
             };
             match evaluate(check, &read) {
@@ -838,7 +1010,7 @@ impl<'a> Locator<'a> {
                     })
                 }
                 Ok(_) => {}
-                Err(miss) if check.gone => return Err(miss),
+                Err(miss) if check.gone || miss.code == "incomplete_read" => return Err(miss),
                 Err(miss) => {
                     let size = read.elements.len();
                     if best_miss.as_ref().is_none_or(|(best, _)| size > *best) {
@@ -874,14 +1046,24 @@ impl<'a> Locator<'a> {
             check.window.clone()
         };
         let started = Instant::now();
-        let deadline = (started + check.timeout).min(self.deadline);
+        let budget = if check.timeout.is_zero() {
+            ZERO_WAIT_PROBE_BUDGET
+        } else {
+            check.timeout
+        };
+        let deadline = (started + budget).min(self.deadline);
         loop {
-            let outcome = self.check_once(check, &window_spec, started).await;
+            let outcome = self
+                .within(
+                    deadline,
+                    self.check_once(check, &window_spec, started, deadline),
+                )
+                .await;
             match outcome {
                 Ok(checked) => return Ok(checked),
                 Err(miss) if !miss.worth_waiting() => return Err(miss),
                 Err(miss) => {
-                    if Instant::now() + POLL_INTERVAL > deadline {
+                    if check.timeout.is_zero() || Instant::now() + POLL_INTERVAL > deadline {
                         let mut miss = miss;
                         miss.message = format!(
                             "{} (checked for {} ms)",
@@ -895,6 +1077,25 @@ impl<'a> Locator<'a> {
             }
         }
     }
+}
+
+fn lookup_timeout() -> Miss {
+    Miss::new(
+        "timeout",
+        "lookup deadline exhausted before a complete read/result was confirmed; target existence is unconfirmed and no input was dispatched by this lookup",
+    )
+}
+
+fn incomplete_read(read: &Read) -> Miss {
+    Miss::new(
+        "incomplete_read",
+        format!(
+            "accessibility read of {} was truncated; {} elements were returned, so absence, uniqueness and state are unconfirmed",
+            read.window.describe(),
+            read.elements.len(),
+        ),
+    )
+    .in_window(&read.window)
 }
 
 /// Elements of a read that match `spec`. Exact name matches win over
@@ -1009,6 +1210,9 @@ fn narrow<'r>(found: Vec<&'r Value>, spec: &ElementSpec) -> Vec<&'r Value> {
 }
 
 fn pick(read: &Read, spec: &ElementSpec) -> Result<Found, Miss> {
+    if read.incomplete {
+        return Err(incomplete_read(read));
+    }
     let found = narrow(matches(read, spec), spec);
     let chosen = match (found.len(), spec.nth) {
         (0, _) => {
@@ -1093,6 +1297,9 @@ fn pick(read: &Read, spec: &ElementSpec) -> Result<Found, Miss> {
 
 /// `Ok(observed)` when the check holds against this read.
 fn evaluate(check: &Check, read: &Read) -> Result<Option<String>, Miss> {
+    if read.incomplete {
+        return Err(incomplete_read(read));
+    }
     let element_spec = ElementSpec {
         nth: None,
         ..check.element.clone()
@@ -1550,6 +1757,7 @@ mod tests {
             },
             elements,
             markdown: markdown.to_owned(),
+            incomplete: false,
         }
     }
 
@@ -1558,9 +1766,761 @@ mod tests {
             "element_index": index,
             "element_token": format!("s00000001:{index}"),
             "role": role,
+            "depth": 1,
             "label": label,
             "frame": {"x": 0, "y": 0, "w": 10, "h": 10},
         })
+    }
+
+    // Hermetic registry seam: reads may complete partially, queue, or outlive
+    // the lookup. No native UI, environment switches, or input is involved.
+    #[derive(Default)]
+    struct ReadFixture {
+        calls: std::sync::Mutex<Vec<Value>>,
+        replies: std::sync::Mutex<std::collections::VecDeque<(Duration, Value)>>,
+        entered: tokio::sync::Notify,
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    struct ReadTool {
+        def: crate::tool::ToolDef,
+        fixture: std::sync::Arc<ReadFixture>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for ReadTool {
+        fn def(&self) -> &crate::tool::ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            if self.def.name == "list_windows" {
+                self.fixture
+                    .lists
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return ToolResult::text("listed before read").with_structured(json!({
+                    "windows":[{"pid":1,"window_id":2,"app_name":"Demo","title":"Doc","bounds":{"x":0,"y":0,"width":100,"height":100},"is_on_screen":true,"z_index":1}]
+                }));
+            }
+            self.fixture.calls.lock().unwrap().push(args);
+            let (delay, state) = self
+                .fixture
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| (Duration::ZERO, state(vec![], false)));
+            self.fixture.entered.notify_one();
+            tokio::time::sleep(delay).await;
+            if state.is_null() {
+                ToolResult::error("fixture read refused")
+            } else if state.get("refusal").is_some() || state.get("code").is_some() {
+                ToolResult::error("fixture structured refusal").with_structured(state)
+            } else {
+                ToolResult::text("fixture read").with_structured(state)
+            }
+        }
+    }
+
+    fn state(elements: Vec<Value>, truncated: bool) -> Value {
+        json!({"pid": 1, "window_id": 2, "elements": elements, "tree_markdown": "", "truncated": truncated})
+    }
+
+    fn registry_with_reads(
+        replies: Vec<(Duration, Value)>,
+    ) -> (ToolRegistry, std::sync::Arc<ReadFixture>) {
+        let fixture = std::sync::Arc::new(ReadFixture::default());
+        fixture.replies.lock().unwrap().extend(replies);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ReadTool {
+            def: crate::tool::ToolDef {
+                name: "get_window_state".into(),
+                description: "hermetic lookup read".into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            fixture: fixture.clone(),
+        }));
+        let mut list_def = registry.get_def("get_window_state").unwrap().clone();
+        list_def.name = "list_windows".into();
+        registry.register(Box::new(ReadTool {
+            def: list_def,
+            fixture: fixture.clone(),
+        }));
+        (registry, fixture)
+    }
+
+    fn exact_window() -> WindowSpec {
+        WindowSpec {
+            pid: Some(1),
+            window_id: Some(2),
+            ..Default::default()
+        }
+    }
+
+    fn save_button() -> ElementSpec {
+        ElementSpec {
+            role: Some("button".into()),
+            name: Some("Save".into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn find_forwards_three_second_budget_and_narrows_only_explicit_non_menu_roles() {
+        let cases = [
+            (save_button(), "AXButton", Some(false)),
+            (
+                ElementSpec {
+                    role: Some("menu_item".into()),
+                    name: Some("Save".into()),
+                    ..Default::default()
+                },
+                "AXMenuItem",
+                None,
+            ),
+            (
+                ElementSpec {
+                    role: Some("menu".into()),
+                    name: Some("Save".into()),
+                    ..Default::default()
+                },
+                "AXMenu",
+                None,
+            ),
+            (
+                ElementSpec {
+                    name: Some("Save".into()),
+                    ..Default::default()
+                },
+                "AXButton",
+                None,
+            ),
+        ];
+        for (selector, role, menu_items) in cases {
+            let (registry, fixture) = registry_with_reads(vec![(
+                Duration::ZERO,
+                state(vec![element(4, role, "Save")], false),
+            )]);
+            let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10));
+            assert_eq!(
+                locator
+                    .find(&exact_window(), &selector, Duration::from_secs(3))
+                    .await
+                    .unwrap()
+                    .token(),
+                Some("s00000001:4")
+            );
+            let calls = fixture.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            let args = &calls[0];
+            assert!(
+                args["timeout_ms"]
+                    .as_u64()
+                    .is_some_and(|ms| ms > 1000 && ms <= 3000),
+                "{args}"
+            );
+            assert_eq!(
+                args.get("include_menu_items").and_then(Value::as_bool),
+                menu_items
+            );
+            assert_eq!(args["full_output"], true);
+            assert_eq!(args["include_screenshot"], false);
+            assert!(args.get("since").is_none());
+            assert_eq!(
+                (args["pid"].as_i64(), args["window_id"].as_u64()),
+                (Some(1), Some(2))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_non_menu_baseline_finds_without_a_second_queued_walk() {
+        let (registry, fixture) = registry_with_reads(vec![
+            (
+                Duration::from_millis(20),
+                state(vec![element(4, "AXButton", "Save")], false),
+            ),
+            (Duration::from_secs(10), state(vec![], false)),
+        ]);
+        let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10))
+            .with_observe_baseline(250);
+        let found = locator
+            .find(&exact_window(), &save_button(), Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert_eq!(found.token(), Some("s00000001:4"));
+        let calls = fixture.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "same complete current read must serve baseline and lookup"
+        );
+        assert_eq!(calls[0]["tree_format"], "both");
+        assert_eq!(calls[0]["include_menu_items"], false);
+        assert_eq!(calls[0]["max_elements"], 250);
+        assert!(
+            calls[0].get("full_output").is_none(),
+            "retain the normal since baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_or_unproven_baseline_never_supplies_a_token() {
+        let partial = state(vec![element(4, "AXButton", "Save")], true);
+        let mut unproven = partial.clone();
+        unproven.as_object_mut().unwrap().remove("truncated");
+        let mut no_elements = state(vec![], false);
+        no_elements.as_object_mut().unwrap().remove("elements");
+        for baseline in [partial, unproven, no_elements] {
+            let mut fresh = element(7, "AXButton", "Save");
+            fresh["element_token"] = json!("s00000002:7");
+            let (registry, fixture) = registry_with_reads(vec![
+                (Duration::from_millis(10), baseline),
+                (Duration::ZERO, state(vec![fresh], false)),
+            ]);
+            let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10))
+                .with_observe_baseline(250);
+            let found = locator
+                .find(&exact_window(), &save_button(), Duration::from_secs(3))
+                .await
+                .unwrap();
+            assert_eq!(found.token(), Some("s00000002:7"));
+            let calls = fixture.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1]["full_output"], true);
+            assert!(
+                calls[1]["timeout_ms"].as_u64().unwrap() < calls[0]["timeout_ms"].as_u64().unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn menu_or_name_only_lookup_cannot_reuse_a_collapsed_baseline() {
+        for selector in [
+            ElementSpec {
+                name: Some("Save".into()),
+                ..Default::default()
+            },
+            ElementSpec {
+                role: Some("menu_item".into()),
+                name: Some("Save".into()),
+                ..Default::default()
+            },
+        ] {
+            let role = if selector.role.is_some() {
+                "AXMenuItem"
+            } else {
+                "AXButton"
+            };
+            let mut fresh = element(7, role, "Save");
+            fresh["element_token"] = json!("s00000002:7");
+            let (registry, fixture) = registry_with_reads(vec![
+                (Duration::ZERO, state(vec![element(4, role, "Save")], false)),
+                (Duration::ZERO, state(vec![fresh], false)),
+            ]);
+            let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10))
+                .with_observe_baseline(250);
+            assert_eq!(
+                locator
+                    .find(&exact_window(), &selector, Duration::from_secs(3))
+                    .await
+                    .unwrap()
+                    .token(),
+                Some("s00000002:7")
+            );
+            let calls = fixture.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert!(calls
+                .iter()
+                .all(|args| args.get("include_menu_items").is_none()));
+        }
+    }
+
+    #[tokio::test]
+    async fn script_read_wrapper_preserves_full_scope_and_incomplete_state() {
+        let (registry, fixture) = registry_with_reads(vec![(Duration::ZERO, state(vec![], true))]);
+        let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(2));
+        let window = Window {
+            pid: 1,
+            window_id: 2,
+            app: None,
+            title: None,
+            on_screen: true,
+        };
+        let read = locator.read(&window).await.unwrap();
+        assert!(read.incomplete);
+        let calls = fixture.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["full_output"], true);
+        assert!(calls[0].get("include_menu_items").is_none());
+        assert!(
+            calls[0].get("timeout_ms").is_none(),
+            "legacy read must retain native default AX budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_missing_target_recovers_with_a_fresh_token_and_remaining_budget() {
+        let mut fresh = element(7, "AXButton", "Save");
+        fresh["element_token"] = json!("s00000002:7");
+        let (registry, fixture) = registry_with_reads(vec![
+            (Duration::from_millis(10), state(vec![], true)),
+            (Duration::ZERO, state(vec![fresh], false)),
+        ]);
+        let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10));
+        let found = locator
+            .find(&exact_window(), &save_button(), Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(found.token(), Some("s00000002:7"));
+        let calls = fixture.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls[1]["timeout_ms"].as_u64().unwrap() < calls[0]["timeout_ms"].as_u64().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_exhaustion_is_incomplete_not_definite_absence_or_a_usable_token() {
+        for elements in [vec![], vec![element(4, "AXButton", "Save")]] {
+            let (registry, fixture) =
+                registry_with_reads(vec![(Duration::ZERO, state(elements, true))]);
+            let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10));
+            let miss = locator
+                .find(&exact_window(), &save_button(), Duration::from_millis(150))
+                .await
+                .unwrap_err();
+            assert_eq!(miss.code, "incomplete_read");
+            assert!(miss.message.contains("truncated") && miss.message.contains("unconfirmed"));
+            assert_eq!(fixture.calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn partial_tree_never_proves_gone_or_a_unique_nth_match() {
+        let mut partial = read(vec![element(4, "AXButton", "Save")], "");
+        partial.incomplete = true;
+        let selector = ElementSpec {
+            nth: Some(1),
+            ..save_button()
+        };
+        assert_eq!(
+            pick(&partial, &selector).unwrap_err().code,
+            "incomplete_read"
+        );
+        let check =
+            Check::parse(&json!({"role":"button","name":"Missing","gone":true}), 100).unwrap();
+        assert_eq!(
+            evaluate(&check, &partial).unwrap_err().code,
+            "incomplete_read"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_deadline_bounds_native_queue_and_late_read_without_another_read() {
+        let (registry, fixture) = registry_with_reads(vec![(
+            Duration::from_secs(10),
+            state(vec![element(4, "AXButton", "Save")], false),
+        )]);
+        let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10));
+        let miss = tokio::time::timeout(
+            Duration::from_secs(1),
+            locator.find(&exact_window(), &save_button(), Duration::from_millis(50)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(miss.code, "timeout");
+        assert!(miss.message.contains("unconfirmed"));
+        assert_eq!(fixture.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn check_and_batch_deadlines_bound_queueing_and_forward_the_smaller_budget() {
+        for batch_first in [false, true] {
+            let (registry, fixture) =
+                registry_with_reads(vec![(Duration::from_secs(10), state(vec![], false))]);
+            let batch_budget = if batch_first {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_secs(10)
+            };
+            let locator = Locator::new(&registry, None, Instant::now() + batch_budget);
+            let check = Check::parse(&json!({"role":"button","name":"Save","timeout_ms": if batch_first { 3000 } else { 50 }}), 3000).unwrap();
+            let miss = tokio::time::timeout(
+                Duration::from_secs(1),
+                locator.check(&check, &exact_window()),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(miss.code, "timeout");
+            let calls = fixture.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0]["timeout_ms"]
+                .as_u64()
+                .is_some_and(|ms| ms > 0 && ms <= 50));
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_batch_budget_sends_no_read_even_for_zero_wait() {
+        let (registry, fixture) = registry_with_reads(vec![]);
+        let expired = Locator::new(&registry, None, Instant::now() - Duration::from_millis(1));
+        assert_eq!(
+            expired
+                .find(&exact_window(), &save_button(), Duration::from_secs(3))
+                .await
+                .unwrap_err()
+                .code,
+            "timeout"
+        );
+        assert_eq!(
+            expired
+                .find(&exact_window(), &save_button(), Duration::ZERO)
+                .await
+                .unwrap_err()
+                .code,
+            "timeout"
+        );
+        assert!(fixture.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_wait_probes_once_without_polling_and_can_find_current_state() {
+        for (state, expected) in [
+            (state(vec![element(4, "AXButton", "Save")], false), "found"),
+            (state(vec![], false), "not_found"),
+            (state(vec![], true), "incomplete_read"),
+        ] {
+            let (registry, fixture) = registry_with_reads(vec![(Duration::ZERO, state)]);
+            let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10));
+            let code = match locator
+                .find(&exact_window(), &save_button(), Duration::ZERO)
+                .await
+            {
+                Ok(_) => "found",
+                Err(miss) => miss.code,
+            };
+            assert_eq!(code, expected);
+            let calls = fixture.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0]["timeout_ms"]
+                .as_u64()
+                .is_some_and(|ms| ms > 0 && ms <= crate::tool_schema::TIMEOUT_MS_DEFAULT));
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_wait_queue_exhaustion_cannot_start_a_second_read() {
+        let (registry, fixture) =
+            registry_with_reads(vec![(Duration::from_secs(10), state(vec![], true))]);
+        let locator = Locator::new(&registry, None, Instant::now() + Duration::from_millis(50))
+            .with_observe_baseline(250);
+        let miss = tokio::time::timeout(
+            Duration::from_secs(1),
+            locator.find(&exact_window(), &save_button(), Duration::ZERO),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(miss.code, "timeout");
+        assert_eq!(
+            fixture.calls.lock().unwrap().len(),
+            1,
+            "expired baseline must not launch the full read"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_wait_gone_probe_is_bounded_and_does_not_poll_still_present() {
+        let (registry, fixture) = registry_with_reads(vec![(
+            Duration::ZERO,
+            state(vec![element(4, "AXButton", "Save")], false),
+        )]);
+        let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10));
+        let check = Check::parse(
+            &json!({"role":"button","name":"Save","gone":true,"timeout_ms":0}),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            locator
+                .check(&check, &exact_window())
+                .await
+                .unwrap_err()
+                .code,
+            "still_present"
+        );
+        assert_eq!(fixture.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_request_during_a_partial_read_does_not_resume_polling() {
+        let (registry, fixture) =
+            registry_with_reads(vec![(Duration::from_secs(10), state(vec![], true))]);
+        let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(30));
+        let window = exact_window();
+        let selector = save_button();
+        let mut request = Box::pin(locator.find(&window, &selector, Duration::from_secs(20)));
+        tokio::select! {
+            _ = fixture.entered.notified() => {},
+            result = &mut request => panic!("read must still be in flight: {result:?}"),
+        }
+        drop(request);
+        tokio::time::sleep(POLL_INTERVAL + Duration::from_millis(25)).await;
+        assert_eq!(fixture.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn gone_does_not_treat_a_refused_read_as_a_closed_window() {
+        let (registry, fixture) = registry_with_reads(vec![(Duration::ZERO, Value::Null)]);
+        let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(5));
+        let check = Check::parse(
+            &json!({"role":"button","name":"Save","gone":true,"timeout_ms":1000}),
+            1000,
+        )
+        .unwrap();
+        let miss = locator.check(&check, &exact_window()).await.unwrap_err();
+        assert_eq!(miss.code, "read_failed");
+        assert!(miss.message.contains("fixture read refused"));
+        assert_eq!(
+            fixture.calls.lock().unwrap().len(),
+            1,
+            "do not poll a refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn gone_accepts_only_structured_missing_window_not_permission_or_error_words() {
+        for (code, expected) in [
+            ("window_id_not_found", None),
+            ("permission_denied", Some("read_failed")),
+            ("window_not_found_in_error_text_only", Some("read_failed")),
+        ] {
+            let (registry, fixture) =
+                registry_with_reads(vec![(Duration::ZERO, json!({"refusal":{"code":code}}))]);
+            let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10));
+            let check = Check::parse(
+                &json!({"role":"button","name":"Save","gone":true,"timeout_ms":0}),
+                1000,
+            )
+            .unwrap();
+            // This app selector forces list_windows before the structured
+            // closed-window refusal, exercising the real list/read race.
+            let spec = WindowSpec {
+                app: Some("Demo".into()),
+                ..exact_window()
+            };
+            let result = locator.check(&check, &spec).await;
+            match expected {
+                None => {
+                    assert!(result.is_ok(), "{result:?}");
+                }
+                Some(code) => assert_eq!(result.unwrap_err().code, code),
+            }
+            assert_eq!(fixture.calls.lock().unwrap().len(), 1);
+            assert_eq!(fixture.lists.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_missing_window_code_is_authoritative_but_other_read_errors_are_not_gone() {
+        for (response, closed) in [
+            (
+                json!({"code":"window_id_not_found","pid":1,"window_id":2}),
+                true,
+            ),
+            (
+                json!({"code":"permission_denied","pid":1,"window_id":2}),
+                false,
+            ),
+            (
+                json!({"code":"ax_reader_busy","pid":1,"window_id":2}),
+                false,
+            ),
+            (
+                json!({"code":"window_id_not_found","refusal":{"code":"permission_denied"}}),
+                false,
+            ),
+        ] {
+            let (registry, fixture) = registry_with_reads(vec![(Duration::ZERO, response)]);
+            let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10));
+            let check = Check::parse(
+                &json!({"role":"button","name":"Save","gone":true,"timeout_ms":0}),
+                1000,
+            )
+            .unwrap();
+            let result = locator.check(&check, &exact_window()).await;
+            if closed {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert_eq!(result.unwrap_err().code, "read_failed");
+            }
+            assert_eq!(fixture.calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    /// Use a known read-only registry surface to enter the real trusted task
+    /// context. The inner registry is the same public seam Locator uses in a
+    /// batch; neither registry bypasses authorization or installs a test hook.
+    struct LookupUnderOwner {
+        def: crate::tool::ToolDef,
+        reads: ToolRegistry,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for LookupUnderOwner {
+        fn def(&self) -> &crate::tool::ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            let session = args
+                .get("_public_session_label")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let locator = Locator::new(
+                &self.reads,
+                session,
+                Instant::now() + Duration::from_secs(10),
+            );
+            let result = locator
+                .find(&exact_window(), &save_button(), Duration::from_secs(5))
+                .await;
+            match result {
+                Ok(found) => ToolResult::text("found").with_structured(
+                    json!({"pid":1,"window_id":2,"code":"found", "element_token":found.token()}),
+                ),
+                Err(miss) => {
+                    ToolResult::error(miss.message).with_structured(json!({"code":miss.code}))
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ending_owner_during_read_returns_no_token_and_starts_no_late_read() {
+        use crate::authorization::PermissionMode;
+        use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+        let (reads, fixture) = registry_with_reads(vec![(
+            Duration::from_secs(10),
+            state(vec![element(4, "AXButton", "Save")], false),
+        )]);
+        let ceiling = SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Standard],
+            false,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let context = SessionAuthorizationRegistry::with_ceiling(ceiling)
+            .compatibility_context(PermissionMode::Standard, None)
+            .unwrap();
+        let runtime_session = context.runtime_session_key("ending-lookup-owner");
+        let def = reads.get_def("get_window_state").unwrap().clone();
+        let mut registry = ToolRegistry::new();
+        for label in ["ending-lookup-owner", "surviving-lookup-owner"] {
+            let key = context.runtime_session_key(label);
+            reads
+                .protected_resource_ownership()
+                .mark_driver_owned_pid(&key, 1);
+            registry
+                .protected_resource_ownership()
+                .mark_driver_owned_pid(&key, 1);
+        }
+        registry.register(Box::new(LookupUnderOwner { def, reads }));
+        let mut request = Box::pin(registry.invoke_with_context(
+            "get_window_state",
+            json!({"pid":1,"window_id":2,"session":"ending-lookup-owner"}),
+            context.clone(),
+        ));
+        tokio::select! {
+            _ = fixture.entered.notified() => {},
+            result = &mut request => panic!("read should be pending before owner ends: {result:?}"),
+        }
+        crate::session::end_session(&runtime_session);
+        assert!(crate::session::is_session_ending(&runtime_session));
+        let result = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["code"],
+            "cancelled"
+        );
+        assert!(result
+            .structured_content
+            .as_ref()
+            .unwrap()
+            .get("element_token")
+            .is_none());
+        tokio::time::sleep(POLL_INTERVAL + Duration::from_millis(25)).await;
+        assert_eq!(fixture.calls.lock().unwrap().len(), 1);
+        fixture.replies.lock().unwrap().push_back((
+            Duration::ZERO,
+            state(vec![element(4, "AXButton", "Save")], false),
+        ));
+        let survivor = registry
+            .invoke_with_context(
+                "get_window_state",
+                json!({"pid":1,"window_id":2,"session":"surviving-lookup-owner"}),
+                context.clone(),
+            )
+            .await;
+        assert_ne!(survivor.is_error, Some(true));
+        assert_eq!(
+            survivor.structured_content.as_ref().unwrap()["code"],
+            "found"
+        );
+        assert_eq!(
+            fixture.calls.lock().unwrap().len(),
+            2,
+            "only the other owner's new read starts"
+        );
+        let late = registry
+            .invoke_with_context(
+                "get_window_state",
+                json!({"pid":1,"window_id":2,"session":"ending-lookup-owner"}),
+                context,
+            )
+            .await;
+        assert_eq!(
+            late.structured_content
+                .as_ref()
+                .and_then(|state| state.pointer("/refusal/code"))
+                .and_then(Value::as_str),
+            Some("session_ended")
+        );
+        assert_eq!(fixture.calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn best_effort_baseline_cannot_consume_a_new_budget_or_hide_timeout() {
+        let (registry, fixture) =
+            registry_with_reads(vec![(Duration::from_secs(10), state(vec![], false))]);
+        let locator = Locator::new(&registry, None, Instant::now() + Duration::from_secs(10))
+            .with_observe_baseline(250);
+        let miss = tokio::time::timeout(
+            Duration::from_secs(1),
+            locator.find(&exact_window(), &save_button(), Duration::from_millis(50)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(miss.code, "timeout");
+        let calls = fixture.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "no full lookup may start after its baseline exhausted the shared budget"
+        );
+        assert_eq!(calls[0]["max_elements"], 250);
+        assert!(calls[0].get("full_output").is_none());
     }
 
     #[test]

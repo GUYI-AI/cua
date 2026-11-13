@@ -22,6 +22,8 @@ struct Ui {
     bubble_open: bool,
     /// Reads left before the "Finish" button appears on screen 2.
     finish_delay_reads: u32,
+    /// Reads whose partial tree must not authorize a named action.
+    partial_reads: u32,
     snapshot: u32,
     /// Element labels of the latest read, by element index.
     last_labels: Vec<(String, String)>,
@@ -129,7 +131,10 @@ impl Tool for Fake {
                 if ui.screen == 1 && window_id == 7 {
                     markdown.push_str("  - AXStaticText \"Step 2 of 2\"\n");
                 }
+                let truncated = ui.partial_reads > 0;
+                ui.partial_reads = ui.partial_reads.saturating_sub(1);
                 ToolResult::text(markdown.clone()).with_structured(json!({
+                    "truncated": truncated,
                     "pid": 42,
                     "window_id": window_id,
                     "snapshot_id": format!("s{snapshot:08x}"),
@@ -508,15 +513,20 @@ async fn the_end_observation_diffs_against_the_batch_start() {
         .await;
     assert_ne!(result.is_error, Some(true), "{}", text(&result));
     let reads = harness.calls("get_window_state");
-    // First a plain read with the observation's budget (remembered by
-    // `since`), then the full lookup read, then the end diff.
+    // The complete plain read serves both the baseline and the lookup; the
+    // end diff still compares against the state before the mutation.
     assert_eq!(reads[0]["max_elements"], 250);
     assert!(reads[0].get("full_output").is_none());
-    assert_eq!(reads[1]["full_output"], true);
+    assert_eq!(reads[0]["tree_format"], "both");
+    assert_eq!(reads[0]["include_menu_items"], false);
     let last = reads.last().unwrap();
     assert_eq!(last["since"], "latest");
     assert_eq!(last["max_elements"], 250);
-    assert_eq!(reads.len(), 3, "one baseline per window, not per poll");
+    assert_eq!(
+        reads.len(),
+        2,
+        "one complete baseline/lookup, then the end diff"
+    );
 
     // Without observe there is no baseline read.
     let before = harness.calls("get_window_state").len();
@@ -542,5 +552,26 @@ async fn a_trailing_get_window_state_in_shorthand_is_the_observation() {
     assert_eq!(
         harness.calls("get_window_state").last().unwrap()["window_id"],
         7
+    );
+}
+
+#[tokio::test]
+async fn partial_lookup_never_dispatches_an_action_even_if_its_target_is_already_visible() {
+    let harness = Harness::new();
+    harness.ui.lock().unwrap().partial_reads = 1;
+    let result = harness
+        .run(json!({"steps":[
+            {"click":{"pid":42,"window_id":7,"role":"button","name":"Next"},"timeout_ms":150},
+            {"click":{"role":"button","name":"Finish"}}
+        ]}))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["steps"][0]["code"],
+        "incomplete_read"
+    );
+    assert!(
+        harness.calls("click").is_empty(),
+        "neither an incomplete match nor a later step may inject input"
     );
 }

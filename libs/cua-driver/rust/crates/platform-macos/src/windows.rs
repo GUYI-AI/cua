@@ -441,10 +441,7 @@ pub fn window_info_by_id(window_id: u32) -> Option<WindowInfo> {
 /// Whether `window_id` is on the current Space of its display. `None` when
 /// WindowServer does not know the window or Space membership is unreadable.
 pub fn window_on_current_space_by_id(window_id: u32) -> Option<bool> {
-    all_windows()
-        .into_iter()
-        .find(|w| w.window_id == window_id)?
-        .on_current_space
+    window_space_view_by_id(window_id)?.on_current_space
 }
 
 /// WindowServer's Space and on-screen view of one layer-0 window.
@@ -459,13 +456,28 @@ pub(crate) struct WindowSpaceView {
 /// [`WindowSpaceView`] of `window_id`, or `None` when WindowServer does not
 /// list it as a layer-0 window.
 pub(crate) fn window_space_view_by_id(window_id: u32) -> Option<WindowSpaceView> {
-    all_windows()
+    // This is a single-window read, used on every click and live capture.
+    // Enumerating Space membership for every other application multiplies
+    // WindowServer IPC by the desktop's window count under parallel previews.
+    window_space_view_in(all_windows_any_layer(), window_id, |id| {
+        let query = crate::input::skylight::SpaceQuery::new()?;
+        let space_ids = query.window_space_ids(id)?;
+        window_on_current_space(Some(&space_ids), query.current_space_for_window(id))
+    })
+}
+
+fn window_space_view_in(
+    windows: impl IntoIterator<Item = WindowInfo>,
+    window_id: u32,
+    mut space: impl FnMut(u32) -> Option<bool>,
+) -> Option<WindowSpaceView> {
+    let window = windows
         .into_iter()
-        .find(|w| w.window_id == window_id)
-        .map(|w| WindowSpaceView {
-            on_current_space: w.on_current_space,
-            is_on_screen: w.is_on_screen,
-        })
+        .find(|w| w.window_id == window_id && w.layer == 0)?;
+    Some(WindowSpaceView {
+        on_current_space: space(window.window_id),
+        is_on_screen: window.is_on_screen,
+    })
 }
 
 /// Look up a window's bounds by its CGWindowID.
@@ -767,6 +779,47 @@ mod tests {
         let mut windows = vec![off_space, titled, on_screen];
         retain_ax_reachable_with(&mut windows, |_| panic!("AX must not be read"));
         assert_eq!(windows.len(), 3);
+    }
+
+    #[test]
+    fn single_window_space_read_does_not_query_unrelated_windows() {
+        let windows = (1..=100).map(|id| window(id, id as i32, "App"));
+        let mut queried = Vec::new();
+        let view = window_space_view_in(windows, 42, |id| {
+            queried.push(id);
+            Some(false)
+        })
+        .expect("target exists");
+        assert_eq!(
+            queried,
+            [42],
+            "only the requested window may query Space membership"
+        );
+        assert_eq!(view.on_current_space, Some(false));
+        assert!(view.is_on_screen);
+    }
+
+    #[test]
+    fn absent_or_accessory_space_target_does_not_query_other_windows() {
+        let mut accessory = window(42, 42, "Menu");
+        accessory.layer = 101;
+        for id in [42, 99] {
+            assert!(window_space_view_in(
+                vec![window(1, 1, "App"), accessory.clone()],
+                id,
+                |_| panic!("no Space query for an absent layer-0 target")
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn single_window_space_read_preserves_unknown_membership_and_visibility() {
+        let mut target = window(42, 42, "App");
+        target.is_on_screen = false;
+        let view = window_space_view_in(vec![target], 42, |_| None).expect("target exists");
+        assert_eq!(view.on_current_space, None);
+        assert!(!view.is_on_screen);
     }
 
     #[test]

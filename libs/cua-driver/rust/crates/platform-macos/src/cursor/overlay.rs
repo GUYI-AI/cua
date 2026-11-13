@@ -449,12 +449,19 @@ pub async fn animate_cursor_to_target(key: CursorKey, x: f64, y: f64, target: Op
     // thread never entered `run_on_main_thread`): the command stays queued
     // for a loop that starts later, and the action proceeds now. Bounded
     // either way.
-    wait_for_arrival(
+    let started = Instant::now();
+    let arrived = wait_for_arrival(
         rx,
         RENDER_LOOP_RUNNING.load(Ordering::Acquire),
         ARRIVAL_TIMEOUT,
     )
     .await;
+    tracing::info!(
+        phase = "cursor_arrival",
+        arrived,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "cua input timing"
+    );
 }
 
 /// Waits for `rx` only while a render loop runs, and never longer than
@@ -710,7 +717,12 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     // ---- Layer-backed content view ----
     let content_view: *mut AnyObject = msg_send![win, contentView];
     let _: () = msg_send![content_view, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![content_view, layer];
+    let root_layer: *mut AnyObject = msg_send![content_view, layer];
+    // Keep the window full-screen for stable ordering, but upload only the
+    // painted tile. A full transparent display-sized CGImage otherwise makes
+    // Core Animation color-convert millions of empty pixels on every tick.
+    let layer: *mut AnyObject = msg_send![class!(CALayer), layer];
+    let _: () = msg_send![root_layer, addSublayer: layer];
 
     // Set layer geometry. contentsScale tells Core Animation that the CGImage
     // we hand to setContents: is already at retina (`backing_scale`×) pixel
@@ -803,14 +815,7 @@ fn render_loop(
 
         let woke_from_idle = first_msg.is_some();
         let now = Instant::now();
-        let dt = if woke_from_idle {
-            // The blocking recv() above can span an arbitrarily long idle period.
-            // Do not charge that time to the first animation tick after a command;
-            // let the wake-up frame render the newly-applied state at t=0.
-            0.0
-        } else {
-            now.duration_since(last_tick).as_secs_f64().min(0.05)
-        };
+        let dt = animation_frame_delta(now.duration_since(last_tick), woke_from_idle);
         last_tick = now;
 
         // Refit before painting, so the frame after a display change (often
@@ -958,7 +963,7 @@ fn render_loop(
         // change pixels. A final frame is emitted as animations/fades finish so
         // the layer is left in the completed/cleared state before blocking.
         if had_msg || refit || hover_changed || frame_tick_needed || next_frame_tick_needed {
-            let pixmap = {
+            let (pixmap, scale) = {
                 let guard = RENDER.lock().unwrap();
                 if let Some(map) = guard.as_ref() {
                     // Allocate the pixmap at the screen's PHYSICAL pixel
@@ -974,18 +979,27 @@ fn render_loop(
                     let backing_scale_f32 = scale as f32;
                     note_overlay_frame(map.cursors.values().any(cursor_may_paint));
                     paint_main_screen(&mut pm, map, backing_scale_f32);
-                    pm
+                    (pm, scale)
                 } else {
                     break;
                 }
             };
 
             // Convert to CGImage and update layer on the main queue.
-            dispatch_set_layer_contents(layer_ptr, pixmap);
+            dispatch_set_layer_contents(layer_ptr, pixmap, scale, win_h);
         }
 
         frame_tick_needed = next_frame_tick_needed;
         hover_poll_needed = next_hover_poll_needed;
+        let frame_elapsed = Instant::now().duration_since(last_tick);
+        if frame_elapsed >= Duration::from_millis(80) {
+            tracing::info!(
+                phase = "cursor_frame",
+                elapsed_ms = frame_elapsed.as_millis() as u64,
+                dt_ms = (dt * 1000.0) as u64,
+                "cua input timing"
+            );
+        }
         if frame_tick_needed {
             // Sleep remainder of frame budget.
             let elapsed = Instant::now().duration_since(last_tick);
@@ -993,6 +1007,18 @@ fn render_loop(
                 std::thread::sleep(remaining);
             }
         }
+    }
+}
+
+/// Trajectories are sampled analytically, not integrated in fixed simulation
+/// steps. Charge their full wall time even when compositing misses a frame;
+/// clipping it slows every arrival while the input coordinator is held.
+/// A wake after an idle recv still starts the new animation at t=0.
+fn animation_frame_delta(elapsed: Duration, woke_from_idle: bool) -> f64 {
+    if woke_from_idle {
+        0.0
+    } else {
+        elapsed.as_secs_f64()
     }
 }
 
@@ -1082,24 +1108,27 @@ fn cursor_is_externally_visible(state: &RenderState) -> bool {
 
 /// Convert a `tiny_skia::Pixmap` to a `CGImage` and set it as the contents
 /// of the given `CALayer` via `dispatch_async(main_queue, ...)`.
-fn dispatch_set_layer_contents(layer_ptr: usize, pixmap: tiny_skia::Pixmap) {
-    // Build the CGImage from the pixmap bytes.
-    let cg_image_ptr = match pixmap_to_cgimage(&pixmap) {
-        Some(p) => p,
-        None => return,
+fn dispatch_set_layer_contents(
+    layer_ptr: usize,
+    pixmap: tiny_skia::Pixmap,
+    scale: f64,
+    full_height: f64,
+) {
+    let tile = painted_tile(&pixmap);
+    let (cg_image_ptr, rect) = match tile {
+        Some(tile) => {
+            let Some(image) = pixmap_to_cgimage(&tile.pixels) else {
+                return;
+            };
+            let rect = tile.layer_rect(full_height, scale);
+            (Some(image), rect)
+        }
+        None => (None, [0.0; 4]),
     };
+    let payload = Box::new((layer_ptr, cg_image_ptr, rect, scale));
 
-    // Box the payload for the C callback.
-    let payload = Box::new((layer_ptr, cg_image_ptr));
-
-    // GCD symbols from libdispatch (part of the macOS system library stubs).
-    // `dispatch_get_main_queue()` is an inline C function; the underlying
-    // symbol is `_dispatch_main_q`, a *struct* (not a pointer).
-    // We declare it as `u8` (opaque placeholder) and take its ADDRESS to
-    // obtain the `dispatch_queue_t` (pointer to the struct).
     #[link(name = "System", kind = "framework")]
     extern "C" {
-        // Opaque placeholder — we only ever take &_dispatch_main_q, never read it.
         static _dispatch_main_q: u8;
         fn dispatch_async_f(
             queue: *const c_void,
@@ -1109,22 +1138,32 @@ fn dispatch_set_layer_contents(layer_ptr: usize, pixmap: tiny_skia::Pixmap) {
     }
 
     unsafe extern "C" fn set_contents_cb(ctx: *mut c_void) {
-        let (layer_ptr, cg_image_ptr): (usize, usize) = *Box::from_raw(ctx as *mut _);
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        let (layer_ptr, image, rect, scale): (usize, Option<usize>, [f64; 4], f64) =
+            *Box::from_raw(ctx as *mut _);
         let layer = layer_ptr as *mut objc2::runtime::AnyObject;
-        // setContents: expects an `id` (type '@'), not a raw void pointer.
-        // CGImageRef is toll-free bridged to NSObject, so we cast it to *mut AnyObject.
-        let cg_id = cg_image_ptr as *mut objc2::runtime::AnyObject;
+        // A plain sublayer otherwise implicitly animates its cropped frame,
+        // adding a second motion behind the already-animated cursor pixels.
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
+        let _: () = objc2::msg_send![layer, setContentsScale: scale];
+        let frame = NSRect::new(
+            NSPoint::new(rect[0], rect[1]),
+            NSSize::new(rect[2], rect[3]),
+        );
+        let _: () = objc2::msg_send![layer, setFrame: frame];
+        let _: () = objc2::msg_send![layer, setHidden: image.is_none()];
+        let cg_id = image.unwrap_or(0) as *mut objc2::runtime::AnyObject;
         let _: () = objc2::msg_send![layer, setContents: cg_id];
-        // Release the CGImage ref we retained in pixmap_to_cgimage.
-        CGImageRelease(cg_image_ptr as *mut c_void);
+        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+        if let Some(image) = image {
+            CGImageRelease(image as *mut c_void);
+        }
     }
-
     extern "C" {
         fn CGImageRelease(image: *mut c_void);
     }
-
     unsafe {
-        // &_dispatch_main_q is the queue pointer (same as dispatch_get_main_queue()).
         let main_queue = &raw const _dispatch_main_q as *const c_void;
         dispatch_async_f(
             main_queue,
@@ -1132,6 +1171,52 @@ fn dispatch_set_layer_contents(layer_ptr: usize, pixmap: tiny_skia::Pixmap) {
             set_contents_cb,
         );
     }
+}
+
+struct PaintedTile {
+    pixels: tiny_skia::Pixmap,
+    left: u32,
+    top: u32,
+}
+
+impl PaintedTile {
+    fn layer_rect(&self, full_height: f64, scale: f64) -> [f64; 4] {
+        [
+            f64::from(self.left) / scale,
+            full_height - f64::from(self.top + self.pixels.height()) / scale,
+            f64::from(self.pixels.width()) / scale,
+            f64::from(self.pixels.height()) / scale,
+        ]
+    }
+}
+
+/// Preserve every nontransparent pixel, including faint trails, focus rings,
+/// labels and multiple cursors. Only truly empty margins are discarded.
+fn painted_tile(pixmap: &tiny_skia::Pixmap) -> Option<PaintedTile> {
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
+    for (index, pixel) in pixmap.data().chunks_exact(4).enumerate() {
+        if pixel[3] == 0 {
+            continue;
+        }
+        let (x, y) = ((index as u32) % width, (index as u32) / width);
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x + 1);
+        bottom = bottom.max(y + 1);
+    }
+    if left == width {
+        return None;
+    }
+    let mut pixels = tiny_skia::Pixmap::new(right - left, bottom - top)?;
+    let target_stride = pixels.width() as usize * 4;
+    for y in top..bottom {
+        let start = ((y * width + left) * 4) as usize;
+        let target = (y - top) as usize * target_stride;
+        pixels.data_mut()[target..target + target_stride]
+            .copy_from_slice(&pixmap.data()[start..start + target_stride]);
+    }
+    Some(PaintedTile { pixels, left, top })
 }
 
 /// Raise the normal-level overlay without activating the driver application.
@@ -1234,7 +1319,9 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
         }
     }
 
-    let windows = crate::windows::visible_windows();
+    // Repinning only compares visible layer-0 ordering; Space metadata for
+    // every application is unrelated and expensive during active rendering.
+    let windows = crate::windows::on_screen_windows_any_layer();
     let raise_front =
         target_is_frontmost_visible_window(target_wid, crate::apps::frontmost_pid(), &windows);
     let payload = Box::new((win_ptr, target_wid, raise_front));
@@ -1379,6 +1466,63 @@ fn pixmap_to_cgimage(pixmap: &tiny_skia::Pixmap) -> Option<usize> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cropped_overlay_preserves_all_painted_pixels_and_empty_frames_clear() {
+        let mut frame = tiny_skia::Pixmap::new(120, 80).unwrap();
+        assert!(painted_tile(&frame).is_none());
+        for (x, y, alpha) in [(11, 13, 255u8), (15, 15, 1), (37, 54, 90), (119, 79, 255)] {
+            let i = ((y * frame.width() + x) * 4) as usize;
+            frame.data_mut()[i..i + 4].copy_from_slice(&[alpha, 0, 0, alpha]);
+        }
+        let tile = painted_tile(&frame).unwrap();
+        assert_eq!((tile.left, tile.top), (11, 13));
+        assert_eq!((tile.pixels.width(), tile.pixels.height()), (109, 67));
+        let mut restored = tiny_skia::Pixmap::new(frame.width(), frame.height()).unwrap();
+        for y in 0..tile.pixels.height() {
+            let start = (y * tile.pixels.width() * 4) as usize;
+            let end = start + tile.pixels.width() as usize * 4;
+            let target = (((y + tile.top) * frame.width() + tile.left) * 4) as usize;
+            restored.data_mut()[target..target + end - start]
+                .copy_from_slice(&tile.pixels.data()[start..end]);
+        }
+        assert_eq!(
+            restored.data(),
+            frame.data(),
+            "faint trails, all owners and edge pixels must survive"
+        );
+        frame.fill(tiny_skia::Color::TRANSPARENT);
+        assert!(
+            painted_tile(&frame).is_none(),
+            "a cleared scene must not retain the old tile"
+        );
+    }
+
+    #[test]
+    fn cropped_overlay_keeps_retina_positions_and_refitted_screen_geometry() {
+        let tile = PaintedTile {
+            pixels: tiny_skia::Pixmap::new(5, 3).unwrap(),
+            left: 11,
+            top: 13,
+        };
+        assert_eq!(tile.layer_rect(40.0, 2.0), [5.5, 32.0, 2.5, 1.5]);
+        assert_eq!(tile.layer_rect(80.0, 2.0), [5.5, 72.0, 2.5, 1.5]);
+        assert_eq!(tile.layer_rect(80.0, 1.0), [11.0, 64.0, 5.0, 3.0]);
+    }
+
+    #[test]
+    fn a_small_cursor_upload_does_not_include_transparent_display_margins() {
+        let mut frame = tiny_skia::Pixmap::new(1920, 1080).unwrap();
+        for y in 100..116 {
+            for x in 200..216 {
+                let i = ((y * frame.width() + x) * 4) as usize;
+                frame.data_mut()[i..i + 4].copy_from_slice(&[255, 0, 0, 255]);
+            }
+        }
+        let tile = painted_tile(&frame).unwrap();
+        assert_eq!((tile.pixels.width(), tile.pixels.height()), (16, 16));
+        assert!(tile.pixels.data().len() * 1000 < frame.data().len());
+    }
+
     /// A human-origin session (a Cua Spaces viewer's relayed input) never
     /// reaches the renderer; an agent's session does. The rule itself lives
     /// in `cua_driver_core::agent_cursor`.
@@ -1475,6 +1619,46 @@ mod tests {
                 backing_scale: 1.0,
             },
         )
+    }
+
+    #[test]
+    fn delayed_frame_reaches_the_planned_arrival_without_extra_lock_time() {
+        let mut map = empty_map();
+        let state = placed(&mut map, "slow-frame");
+        state.apply_command(OverlayCommand::MoveTo {
+            x: 800.0,
+            y: 600.0,
+            end_heading_radians: std::f64::consts::FRAC_PI_4,
+            target: None,
+        });
+        let arrival = state
+            .core
+            .trajectory
+            .as_ref()
+            .expect("a real planned glide")
+            .arrival_t;
+        assert!(arrival > 0.05);
+        let elapsed = Duration::from_secs_f64(arrival + 0.01);
+        assert!(
+            state.tick(animation_frame_delta(elapsed, false)),
+            "a late render frame must signal the elapsed trajectory's arrival"
+        );
+        assert!(!state.tick(0.0), "arrival is signaled exactly once");
+    }
+
+    #[test]
+    fn idle_time_is_not_charged_to_a_new_cursor_glide() {
+        let mut map = empty_map();
+        let state = placed(&mut map, "idle-wake");
+        state.apply_command(OverlayCommand::MoveTo {
+            x: 800.0,
+            y: 600.0,
+            end_heading_radians: std::f64::consts::FRAC_PI_4,
+            target: None,
+        });
+        assert!(!state.tick(animation_frame_delta(Duration::from_secs(3600), true)));
+        assert!(state.core.is_moving());
+        assert_eq!(state.core.motion_t, 0.0);
     }
 
     fn placed<'a>(map: &'a mut RenderMap, key: &str) -> &'a mut RenderState {

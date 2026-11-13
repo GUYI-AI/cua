@@ -181,7 +181,7 @@ fn delivery_failed(error: impl std::fmt::Display) -> ToolResult {
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "press_key".into(),
-        description: "On macOS, unmodified Return after this session edits a Chromium address bar confirms its associated native suggestion through accessibility without switching a sibling window key; observe the target page to verify navigation. On macOS, an unmodified Return after this session focuses or types into a Chromium address bar confirms its associated native suggestion through accessibility without switching a sibling window key; observe the target page to verify navigation. Press and release one key. `delivery_mode` as in click/type_text.\n\
+        description: "On macOS, unmodified Return after this session edits a Chromium address bar confirms its associated native suggestion through accessibility without switching a sibling window key; observe the target page to verify navigation. Press and release one key. `delivery_mode` as in click/type_text.\n\
             - `background` (default): posts to the pid without raising the window; with `element_token` it focuses that element first.\n\
             - `foreground`: fronts the exact window (needs `window_id`), sends a real HID key transition (Chromium content, inline editors, menu equivalents), then restores the prior app.\n\
             \n\

@@ -92,6 +92,36 @@ impl<T: Tool> Tool for Reset<T> {
     fn def(&self) -> &ToolDef {
         self.inner.def()
     }
+    // A lifecycle decorator must preserve implementation attestation. In
+    // particular kill_app proves a process-instance fingerprint here; falling
+    // back to Tool's defaults would discard that protected resource boundary.
+    fn has_independent_input_lane(&self, args: &Value) -> bool {
+        self.inner.has_independent_input_lane(args)
+    }
+    async fn protected_resource_ownership(
+        &self,
+        adapter: &str,
+        args: &Value,
+    ) -> cua_driver_core::tool::ProtectedResourceOwnership {
+        self.inner.protected_resource_ownership(adapter, args).await
+    }
+    async fn protected_resource_scope(
+        &self,
+        adapter: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        self.inner.protected_resource_scope(adapter, args).await
+    }
+    async fn validate_protected_resource_scope(
+        &self,
+        adapter: &str,
+        args: &Value,
+        scope: &Value,
+    ) -> Result<(), String> {
+        self.inner
+            .validate_protected_resource_scope(adapter, args, scope)
+            .await
+    }
     async fn invoke(&self, args: Value) -> ToolResult {
         self.routes.clear(&args);
         self.inner.invoke(args).await
@@ -767,5 +797,77 @@ mod tests {
         assert_eq!(data["route"], "accessibility");
         assert_eq!(data["effect"], "confirmed");
         assert!(execution_record(&Action::Confirm).public_result().is_ok());
+    }
+    struct DelegationFixture;
+    #[async_trait::async_trait]
+    impl Tool for DelegationFixture {
+        fn def(&self) -> &ToolDef {
+            static INNER: WireFixture = WireFixture;
+            INNER.def()
+        }
+        fn has_independent_input_lane(&self, _args: &Value) -> bool {
+            true
+        }
+        async fn protected_resource_ownership(
+            &self,
+            _adapter: &str,
+            _args: &Value,
+        ) -> cua_driver_core::tool::ProtectedResourceOwnership {
+            cua_driver_core::tool::ProtectedResourceOwnership::DriverOwned
+        }
+        async fn protected_resource_scope(
+            &self,
+            _adapter: &str,
+            args: &Value,
+        ) -> Result<Option<Value>, String> {
+            Ok(Some(json!({"pid":args["pid"],"native_identity":"fixture"})))
+        }
+        async fn validate_protected_resource_scope(
+            &self,
+            _adapter: &str,
+            _args: &Value,
+            _scope: &Value,
+        ) -> Result<(), String> {
+            Err("inner-validation-marker".into())
+        }
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            ToolResult::text("delegated")
+        }
+    }
+    #[tokio::test]
+    async fn reset_preserves_implementation_attested_input_and_resource_contracts() {
+        let args = json!({"pid":42});
+        let wrapped = Reset::new(DelegationFixture, Arc::new(Routes::default()));
+        assert!(wrapped.has_independent_input_lane(&args));
+        assert_eq!(
+            wrapped
+                .protected_resource_ownership("process_control", &args)
+                .await,
+            cua_driver_core::tool::ProtectedResourceOwnership::DriverOwned
+        );
+        assert_eq!(
+            wrapped
+                .protected_resource_scope("process_control", &args)
+                .await
+                .unwrap(),
+            Some(json!({"pid":42,"native_identity":"fixture"}))
+        );
+        assert_eq!(
+            wrapped
+                .validate_protected_resource_scope("process_control", &args, &json!({}))
+                .await,
+            Err("inner-validation-marker".into())
+        );
+        // The real kill tool must still reject an invalid process identity at
+        // the attestation boundary, before any termination can be dispatched.
+        let kill = Reset::new(
+            super::super::kill_app::KillAppTool,
+            Arc::new(Routes::default()),
+        );
+        assert_eq!(
+            kill.protected_resource_scope("process_control", &json!({"pid":-1}))
+                .await,
+            Err("kill_app requires a positive integer pid".into())
+        );
     }
 }

@@ -57,7 +57,7 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "type_text".into(),
-        description: "Insert text via `AXSetAttribute(kAXSelectedText)` into the element given by `element_token`, or the pid's focused element. Does not press keys: use `press_key` / `hotkey` for Return, Escape, arrows. If AX insertion is unsupported (Chromium/Electron), it falls back to CGEvent typing when the route fits the transport budget; longer routes are refused with a safe chunk size.\n\
+        description: "On macOS, this session's Chromium address-bar text uses accessibility value and selection updates without document-marking keystrokes. On macOS, text inserted into this session's Chromium address bar uses accessibility selection insertion without document-marking keystrokes. Insert text via `AXSetAttribute(kAXSelectedText)` into the element given by `element_token`, or the pid's focused element. Does not press keys: use `press_key` / `hotkey` for Return, Escape, arrows. If AX insertion is unsupported (Chromium/Electron), it falls back to CGEvent typing when the route fits the transport budget; longer routes are refused with a safe chunk size.\n\
             \n\
             Web content (browser tabs, Slack, VS Code): AXValue is not proof the DOM saw the text, so the result is `effect:\"unverifiable\"` and Electron web content refuses background delivery. For a browser tab use the `page` tool. For an embedded web view pass `x, y` (no element_token) to pixel-click the field then type in one call; a pixel click will not reliably open a closed control, so AX-press it open first. Confirm from the screenshot, and use `delivery_mode:\"foreground\"` only if background still drops the text.".into(),
         input_schema: serde_json::json!({
@@ -207,6 +207,21 @@ impl Tool for TypeTextTool {
             return ToolResult::error(
                 "Pass either element_token (ax) or x,y (px) to type_text, not both.",
             );
+        }
+
+        if let Some(result) = super::browser_address_bar::route(
+            self.state.clone(),
+            &args,
+            pid,
+            window_id,
+            element_guard.as_ref().map(|g| g.as_ptr()),
+            delivery_mode.is_foreground(),
+            px.is_some() || py.is_some(),
+            super::browser_address_bar::Operation::Text(text.clone()),
+        )
+        .await
+        {
+            return result;
         }
 
         let element_guard = element_guard.zip(element_index);

@@ -31,7 +31,7 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "hotkey".into(),
         description:
-            "Press a key combination — e.g. `[\"cmd\", \"c\"]` for Copy, \
+            "On macOS, background Cmd+L in a recognized Chromium native window selects the address bar as this session's text target through accessibility; text and Return then use its associated native suggestion without switching a sibling window key. Press a key combination — e.g. `[\"cmd\", \"c\"]` for Copy, \
              `[\"cmd\", \"shift\", \"4\"]` for screenshot selection. Follows the same \
              `delivery_mode` ladder as click/type_text — it does NOT raise the \
              window by default:\n\
@@ -287,6 +287,24 @@ impl Tool for HotkeyTool {
             window_id,
         ) {
             return error;
+        }
+
+        if let Some(result) = super::browser_address_bar::route(
+            self.state.clone(),
+            &args,
+            pid,
+            window_id,
+            element_ptr,
+            fg,
+            px.is_some() || py.is_some(),
+            super::browser_address_bar::Operation::Hotkey {
+                key: key.clone(),
+                modifiers: modifiers.clone(),
+            },
+        )
+        .await
+        {
+            return result;
         }
 
         // ── Menu key equivalents in a background app ──

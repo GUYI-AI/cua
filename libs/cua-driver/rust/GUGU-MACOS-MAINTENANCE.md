@@ -1,0 +1,11 @@
+# macOS maintenance branch
+
+`gugu/0.36.0` contains upstream `6d6c734c127025fb39ad5d585a10382808b39dc1` plus the existing 0.36.0-gugu.1 maintenance patch, imported without changes. This PR proposes revision **0.36.0-gugu.2**; it does not publish an asset or replace an installed driver. The executable keeps the upstream `cua-driver 0.36.0` version; the archive revision, exact source commit and SHA-256 distinguish maintenance builds.
+
+The Chromium background location route selects a UTF-16 accessibility range, inserts text through AXValue and confirms through the associated native suggestion. It does not send keyboard events or make the target window key. On current Chrome, AXFocused, AXPress on the address field and net-zero keyboard edits can each disturb a sibling window. Selection follows the shape proposed in upstream trycua/cua#5976 without adding a public tool.
+
+The suggestion is proved afresh: native browser identity from the actual PID, exact main-window identity, logical reachability from that window, a distinct WindowServer-owned popup, and no reachability from another main window in the same process. Ordinary web content cannot authorize the route. Existing generic window validation and non-browser/foreground input stay intact.
+
+Computer Use App owns distribution: its runtime pins an immutable universal archive URL and SHA-256. A future release would upload `cua-driver-rs-0.36.0-gugu.2-darwin-universal-binary.tar.gz` to tag `cua-driver-rs-v0.36.0-gugu.2` in GUYI-AI/cua, then publish App 0.5.1. The App downloads and verifies the archive, architecture, signature and upstream executable version into its hash-addressed native cache. A different hash uses a different directory, retaining existing processes and binaries. This App path requires no client release. Release operations are deliberately not part of this PR.
+
+Build with Rust nightly-2026-06-25 (rustc 1.98.0-nightly, commit f28ac764c), the checked-in Cargo.lock, macOS SDK and both Apple targets. Run `cargo +nightly-2026-06-25 test --locked -p platform-macos --lib`; compile arm64 and x86_64 release slices, combine with lipo and ad-hoc sign the candidate. Intel cross-compilation is not Intel GUI acceptance. Full real-window acceptance is maintained with the paired App PR.

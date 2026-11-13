@@ -1,6 +1,7 @@
 //! MCP tool implementations for macOS.
 
 mod bring_to_front;
+pub(crate) mod browser_address_bar;
 mod capture_binding;
 mod click;
 mod clipboard;
@@ -868,6 +869,7 @@ impl Default for SessionConfigRegistry {
 /// Shared state passed to all tools.
 pub struct ToolState {
     pub snapshots: Arc<Snapshots>,
+    pub(crate) address_bar_routes: Arc<browser_address_bar::Routes>,
     pub cursor_registry: Arc<CursorRegistry>,
     pub(crate) capture_bindings: Arc<capture_binding::MacCaptureBindings>,
     /// Global, disk-persisted config — the base layer and the only one the
@@ -920,6 +922,7 @@ impl ToolState {
     ) -> Self {
         Self {
             snapshots: Arc::new(Snapshots::new()),
+            address_bar_routes: Arc::new(browser_address_bar::Routes::default()),
             cursor_registry: Arc::new(CursorRegistry::new()),
             capture_bindings: Arc::new(capture_binding::MacCaptureBindings::new(capture_service)),
             // Load persisted config from ~/.cua-driver/config.json so that
@@ -1076,12 +1079,14 @@ pub fn register_all(
     // recording ownership is handled separately on the core RecordingSession.
     {
         let session_config = state.session_config.clone();
+        let address_bar_routes = state.address_bar_routes.clone();
         let snapshots = state.snapshots.clone();
         let cursor_registry = state.cursor_registry.clone();
         let capture_bindings = state.capture_bindings.clone();
         let registration =
             cua_driver_core::session::register_scoped_session_end_hook(move |session_id| {
                 session_config.clear(session_id);
+                address_bar_routes.retire(session_id);
                 snapshots.retire_session_screenshots(session_id);
                 capture_bindings.retire_session(session_id);
                 // Per-session agent cursor: the session_id is the cursor key when
@@ -1114,29 +1119,56 @@ pub fn register_all(
             ),
         )),
     ));
-    registry.register(Box::new(launch_app::LaunchAppTool));
-    registry.register(Box::new(kill_app::KillAppTool));
+    registry.register(Box::new(browser_address_bar::Reset::new(
+        launch_app::LaunchAppTool,
+        state.address_bar_routes.clone(),
+    )));
+    registry.register(Box::new(browser_address_bar::Reset::new(
+        kill_app::KillAppTool,
+        state.address_bar_routes.clone(),
+    )));
     let pid_window_candidates: WindowTargetCandidates = Arc::new(pid_window_target_candidates);
     registry.register(pid_window_guarded(
-        bring_to_front::BringToFrontTool,
+        browser_address_bar::Reset::new(
+            bring_to_front::BringToFrontTool,
+            state.address_bar_routes.clone(),
+        ),
         &pid_window_candidates,
     ));
-    registry.register(Box::new(set_window_frame::SetWindowFrameTool));
-    registry.register(Box::new(invoke_menu::InvokeMenuTool));
+    registry.register(Box::new(browser_address_bar::Reset::new(
+        set_window_frame::SetWindowFrameTool,
+        state.address_bar_routes.clone(),
+    )));
+    registry.register(Box::new(browser_address_bar::Reset::new(
+        invoke_menu::InvokeMenuTool,
+        state.address_bar_routes.clone(),
+    )));
     registry.register(pid_window_guarded(
-        click::ClickTool::new(state.clone()),
+        browser_address_bar::Reset::new(
+            click::ClickTool::new(state.clone()),
+            state.address_bar_routes.clone(),
+        ),
         &pid_window_candidates,
     ));
     registry.register(pid_window_guarded(
-        double_click::DoubleClickTool::new(state.clone()),
+        browser_address_bar::Reset::new(
+            double_click::DoubleClickTool::new(state.clone()),
+            state.address_bar_routes.clone(),
+        ),
         &pid_window_candidates,
     ));
     registry.register(pid_window_guarded(
-        right_click::RightClickTool::new(state.clone()),
+        browser_address_bar::Reset::new(
+            right_click::RightClickTool::new(state.clone()),
+            state.address_bar_routes.clone(),
+        ),
         &pid_window_candidates,
     ));
     registry.register(pid_window_guarded(
-        drag::DragTool::new(state.clone()),
+        browser_address_bar::Reset::new(
+            drag::DragTool::new(state.clone()),
+            state.address_bar_routes.clone(),
+        ),
         &pid_window_candidates,
     ));
     registry.register(pid_keyboard_guarded(

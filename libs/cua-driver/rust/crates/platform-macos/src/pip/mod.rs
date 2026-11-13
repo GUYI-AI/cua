@@ -194,8 +194,9 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
 // ── AppKit main loop helper for Serve mode ───────────────────────────────
 
 /// Park the main thread in `NSApplication.run()`. Used by `cua-driver
-/// serve --experimental-pip` so the dispatch_async_f → main queue
-/// path PiP frames go through can be drained. Mirrors the cursor
+/// serve` whenever the cursor overlay is off and the process has a graphic
+/// session, so work sent to the main queue (PiP frames, the drag-and-drop
+/// pointer-hold shield) is drained. Mirrors the cursor
 /// overlay's `run_appkit` startup (Accessory activation policy →
 /// finishLaunching → run) without installing the overlay's
 /// CALayer-backed window itself.

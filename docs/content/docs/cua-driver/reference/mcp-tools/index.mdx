@@ -122,7 +122,7 @@ Type text into a field or window. [Reference](/cua-driver/reference/mcp-tools/ke
 
 | Tool | Description | Platforms |
 | --- | --- | --- |
-| <span id="type_text"></span>[`type_text`](/cua-driver/reference/mcp-tools/keyboard#type_text) | Insert text via `AXSetAttribute(kAXSelectedText)` into the element given by `element_token`, or the pid's focused element. | macOS, Linux, Windows |
+| <span id="type_text"></span>[`type_text`](/cua-driver/reference/mcp-tools/keyboard#type_text) | On macOS, this session's Chromium address-bar text uses accessibility value and selection updates without document-marking keystrokes. | macOS, Linux, Windows |
 
 ## Key and shortcut tools
 
@@ -130,8 +130,8 @@ Press keys and keyboard shortcuts. [Reference](/cua-driver/reference/mcp-tools/k
 
 | Tool | Description | Platforms |
 | --- | --- | --- |
-| <span id="press_key"></span>[`press_key`](/cua-driver/reference/mcp-tools/keys-and-shortcuts#press_key) | Press and release one key. | macOS, Linux, Windows |
-| <span id="hotkey"></span>[`hotkey`](/cua-driver/reference/mcp-tools/keys-and-shortcuts#hotkey) | Press a key combination: e.g. | macOS, Linux, Windows |
+| <span id="press_key"></span>[`press_key`](/cua-driver/reference/mcp-tools/keys-and-shortcuts#press_key) | On macOS, unmodified Return after this session edits a Chromium address bar confirms its associated native suggestion through accessibility without switching a sibling window key; observe the target page to verify navigation. | macOS, Linux, Windows |
+| <span id="hotkey"></span>[`hotkey`](/cua-driver/reference/mcp-tools/keys-and-shortcuts#hotkey) | On macOS, background Cmd+L in a recognized Chromium native window selects the address bar as this session's text target through accessibility; text and Return then use its associated native suggestion without switching a sibling window key. | macOS, Linux, Windows |
 
 ## Value and clipboard tools
 

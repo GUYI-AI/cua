@@ -113,6 +113,11 @@ pub unsafe fn ensure_marked_after_ax_write(
     element: AXUIElementRef,
     caret_to_end: bool,
 ) -> DocumentEdited {
+    // Browser chrome is not an NSDocument even when its window exposes AXDocument.
+    // The net-zero key edit would temporarily take key from a sibling window.
+    if crate::tools::browser_address_bar::is_address_bar(pid, element as usize) {
+        return DocumentEdited::NotADocument;
+    }
     if !in_document_window(element) {
         return DocumentEdited::NotADocument;
     }

@@ -43,6 +43,7 @@ Refusals: `window_id_not_found`; `window_owner_pid_mismatch` names the real `own
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="get_window_state--macos--include_accessibility_tree"></span>`include_accessibility_tree` | `boolean` |  | Default true. False skips the AX walk and returns the screenshot plus window metadata. Both this and include_screenshot false is an error. |
+| <span id="get_window_state--macos--include_menu_items"></span>`include_menu_items` | `boolean` |  | Expand closed menu-bar menus. By default full_output/query expands them. False keeps titles and any open menu, avoiding unrelated closed-menu walks while preserving the window controls. |
 | <span id="get_window_state--macos--include_screenshot"></span>`include_screenshot` | `boolean` |  | Default true. False returns the tree only (saves image tokens and latency); screenshot_out_file still forces a capture. |
 | <span id="get_window_state--macos--max_depth"></span>`max_depth` | `integer` |  | Cap on walk depth. Default 25. Minimum: 1. |
 | <span id="get_window_state--macos--max_dimension"></span>`max_dimension` | `integer` |  | Optional cap on the returned screenshot's long edge, in pixels (aspect ratio preserved): the cheap path for a small preview / thumbnail. Applied on top of the session/global max_image_dimension ceiling; the tighter of the two wins. Omit for the configured default. Minimum: 1. |

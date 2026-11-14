@@ -110,6 +110,9 @@ impl Tool for SetValueTool {
             };
 
         let element_ptr = element_guard.as_ptr();
+        self.state
+            .address_bar_routes
+            .retain_field(&args, pid, window_id, element_ptr);
 
         // set_value is an always-background semantic AX mutation. Re-prove
         // that the retained element still belongs to the requested exact

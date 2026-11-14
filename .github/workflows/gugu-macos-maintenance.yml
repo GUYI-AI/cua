@@ -1,0 +1,28 @@
+name: Gugu macOS maintenance
+on:
+  pull_request:
+    branches: [gugu/0.36.0]
+    paths:
+      - 'libs/cua-driver/rust/**'
+      - '.github/workflows/gugu-macos-maintenance.yml'
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 2
+    defaults:
+      run:
+        working-directory: libs/cua-driver/rust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the recorded compiler
+        run: rustup toolchain install nightly-2026-06-25 --profile minimal --component rustfmt
+      - name: Check formatting
+        run: cargo +nightly-2026-06-25 fmt --all -- --check
+      - name: Native unit tests
+        run: cargo +nightly-2026-06-25 test --locked -p platform-macos --lib
+      - name: Build the maintained driver
+        run: cargo +nightly-2026-06-25 build --locked --release -p cua-driver
